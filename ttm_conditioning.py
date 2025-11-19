@@ -40,8 +40,8 @@ class WanTTMConditioning(io.ComfyNode):
                            tooltip="Motion control start (must be >= tweak_index)"),
             ],
             outputs=[
-                io.Conditioning.Output("positive"),
-                io.Conditioning.Output("negative"),
+                io.Conditioning.Output("positive_out", display_name="positive"),
+                io.Conditioning.Output("negative_out", display_name="negative"),
                 io.Latent.Output("latent"),
             ],
         )
