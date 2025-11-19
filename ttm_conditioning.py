@@ -182,12 +182,22 @@ class WanTTMConditioning(io.ComfyNode):
             "ttm_tstrong_index": tstrong_index,
         }
         
-        # Append to conditioning
-        positive = comfy.utils.conditioning_set_values(positive, ttm_conditioning)
-        negative = comfy.utils.conditioning_set_values(negative, ttm_conditioning)
+        # Append to conditioning (ComfyUI format: list of tuples (cond_dict, extra_dict))
+        def append_to_conditioning(cond, params):
+            new_cond = []
+            for t in cond:
+                # t is a tuple: (cond_dict, extra_dict)
+                # Copy and update extra_dict
+                n = [t[0], t[1].copy()]
+                n[1].update(params)
+                new_cond.append(tuple(n))
+            return new_cond
+        
+        positive_out = append_to_conditioning(positive, ttm_conditioning)
+        negative_out = append_to_conditioning(negative, ttm_conditioning)
         
         return io.NodeOutput(
-            positive,
-            negative,
+            positive_out,
+            negative_out,
             {"samples": latent}
         )
