@@ -16,28 +16,31 @@ class WanTTMConditioning(io.ComfyNode):
             category="conditioning",
             description="Prepare TTM motion conditioning for dual-clock denoising",
             inputs=[
-                # Core inputs
+                # Core
                 io.Conditioning.Input("positive"),
                 io.Conditioning.Input("negative"),
                 io.Vae.Input("vae"),
                 
-                # Media inputs
+                # Media
                 io.Image.Input("start_image", tooltip="Starting frame"),
-                io.Image.Input("motion_signal_video", tooltip="Motion reference video (IMAGE batch)"),
-                io.Image.Input("motion_signal_mask", tooltip="Motion mask (IMAGE batch)"),
+                io.Image.Input("motion_signal_video", tooltip="Motion reference video"),
+                io.Image.Input("motion_signal_mask", tooltip="Motion mask"),
                 
-                # Video dimensions
-                io.Int.Input("width", default=832, min=64, max=2048, step=8),
-                io.Int.Input("height", default=480, min=64, max=2048, step=8),
-                io.Int.Input("num_frames", default=81, min=5, max=257, step=4),
-                io.Int.Input("batch_size", default=1, min=1, max=16, step=1,
+                # Video Settings
+                io.Int.Input("width", default=832, min=256, max=2048, step=8,
+                           tooltip="Video width (divisible by 8)"),
+                io.Int.Input("height", default=480, min=256, max=2048, step=8,
+                           tooltip="Video height (divisible by 8)"),
+                io.Int.Input("num_frames", default=81, min=9, max=257, step=4,
+                           tooltip="Total frames (81 typical)"),
+                io.Int.Input("batch_size", default=1, min=1, max=4, step=1,
                            tooltip="Batch size (usually 1)"),
                 
-                # TTM dual-clock control (slider-friendly ranges)
-                io.Int.Input("tweak_index", default=3, min=0, max=15, step=1,
-                           tooltip="Background denoising start (0-15, typically 2-5)"),
-                io.Int.Input("tstrong_index", default=7, min=0, max=20, step=1,
-                           tooltip="Motion control start (must be >= tweak_index)"),
+                # TTM Dual-Clock
+                io.Int.Input("tweak_index", default=3, min=0, max=10, step=1,
+                           tooltip="Background denoise start (2-5 typical)"),
+                io.Int.Input("tstrong_index", default=7, min=0, max=15, step=1,
+                           tooltip="Motion control start (>= tweak)"),
             ],
             outputs=[
                 io.Conditioning.Output("positive_out", display_name="positive"),

@@ -9,7 +9,13 @@ print("=" * 60)
 
 # Test 1: File existence
 print("\n[1] File Existence")
-files = ['__init__.py', 'nodes_ttm.py', 'ttm_conditioning.py', 'ttm_sampler.py', 'requirements.txt', 'README.md']
+files = [
+    "__init__.py",
+    "nodes_ttm.py",
+    "ttm_conditioning.py",
+    "ttm_sampler.py",
+    "requirements.txt",
+]
 for f in files:
     status = "OK  " if os.path.exists(f) else "FAIL"
     print(f"  [{status}] {f}")
@@ -42,10 +48,10 @@ print(f"  WanTTMConditioning:")
 print(f"    define_schema: {'YES' if has_schema1 else 'NO'}")
 print(f"    execute:       {'YES' if has_execute1 else 'NO'}")
 
-# Check WanTTMSampler  
-has_schema2 = has_method('ttm_sampler.py', 'WanTTMSampler', 'define_schema')
-has_execute2 = has_method('ttm_sampler.py', 'WanTTMSampler', 'execute')
-print(f"  WanTTMSampler:")
+# Check WanTTMSamplerComplete
+has_schema2 = has_method('ttm_sampler.py', 'WanTTMSamplerComplete', 'define_schema')
+has_execute2 = has_method('ttm_sampler.py', 'WanTTMSamplerComplete', 'execute')
+print(f"  WanTTMSamplerComplete:")
 print(f"    define_schema: {'YES' if has_schema2 else 'NO'}")
 print(f"    execute:       {'YES' if has_execute2 else 'NO'}")
 

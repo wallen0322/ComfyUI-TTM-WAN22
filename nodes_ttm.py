@@ -8,8 +8,7 @@ from typing_extensions import override
 from comfy_api.latest import ComfyExtension, io
 
 from .ttm_conditioning import WanTTMConditioning
-from .ttm_sampler import WanTTMSampler
-from .ttm_sampler_complete import WanTTMSamplerComplete
+from .ttm_sampler import WanTTMSamplerComplete
 
 
 class TTMExtension(ComfyExtension):
@@ -17,8 +16,7 @@ class TTMExtension(ComfyExtension):
     async def get_node_list(self) -> list[type[io.ComfyNode]]:
         return [
             WanTTMConditioning,
-            WanTTMSamplerComplete,  # Complete implementation with MoE + TTM
-            WanTTMSampler,  # Legacy/simple version
+            WanTTMSamplerComplete,
         ]
 
 
