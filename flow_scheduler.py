@@ -27,8 +27,22 @@ def _generate_flow_sigmas(model_sampling, steps: int) -> torch.Tensor:
         sigmas.append(0.0)
         return torch.tensor(sigmas, dtype=torch.float32)
 
-    # Fallback to default discrete scheduler (non-flow models)
-    return comfy.samplers.simple_scheduler(model_sampling, steps)
+    # Fallback to Wan FlowMatch schedule (mirrors FlowMatchSchedulerResMultistep)
+    sigma_max = getattr(model_sampling, "sigma_max", 1.0)
+    sigma_min = getattr(model_sampling, "sigma_min", 0.003 / 1.002)
+    shift = getattr(model_sampling, "flow_shift", 3.0)
+    train_steps = getattr(model_sampling, "flow_train_steps", 1000)
+
+    full_sigmas = torch.linspace(float(sigma_max), float(sigma_min), int(train_steps), dtype=torch.float32)
+    stride = len(full_sigmas) / max(steps, 1)
+    sampled = []
+    for i in range(steps):
+        idx = min(int(round(i * stride)), len(full_sigmas) - 1)
+        sampled.append(full_sigmas[idx])
+    sampled.append(torch.tensor(0.0, dtype=torch.float32))
+    sigmas = torch.stack(sampled)
+    sigmas = shift * sigmas / (1 + (shift - 1) * sigmas)
+    return sigmas
 
 
 def register_flow_scheduler():

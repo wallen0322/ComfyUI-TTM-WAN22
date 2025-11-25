@@ -25,6 +25,95 @@ from comfy.samplers import KSAMPLER
 import nodes
 from .flow_scheduler import FLOW_SCHEDULER_NAME, sample_flowmatch
 
+# FlowMatch scheduler implementation (aligned with KJ's WanVideoWrapper)
+sigma_fn = lambda t: t.neg().exp()
+t_fn = lambda sigma: sigma.log().neg()
+phi1_fn = lambda t: torch.expm1(t) / t
+phi2_fn = lambda t: (phi1_fn(t) - 1.0) / t
+
+class FlowMatchSchedulerResMultistep:
+    def __init__(self, num_inference_steps=100, num_train_timesteps=1000, shift=3.0, sigma_max=1.0, sigma_min=0.003 / 1.002, extra_one_step=False):
+        self.num_train_timesteps = num_train_timesteps
+        self.shift = shift
+        self.sigma_max = sigma_max
+        self.sigma_min = sigma_min
+        self.extra_one_step = extra_one_step
+        self.set_timesteps(num_inference_steps)
+        self.prev_model_output = None
+        self.old_sigma_next = None
+
+    def set_timesteps(self, num_inference_steps=100, denoising_strength=1.0, sigmas=None):
+        if self.extra_one_step:
+            sigma_start = self.sigma_min + (self.sigma_max - self.sigma_min) * denoising_strength
+            self.sigmas = torch.linspace(sigma_start, self.sigma_min, num_inference_steps + 1)[:-1]
+        full_sigmas = torch.linspace(self.sigma_max, self.sigma_min, self.num_train_timesteps)
+        ss = len(full_sigmas) / num_inference_steps
+        if sigmas is None:
+            sigmas = []
+            for x in range(num_inference_steps):
+                idx = int(round(x * ss))
+                sigmas.append(float(full_sigmas[idx]))
+            sigmas.append(0.0)
+        self.sigmas = torch.FloatTensor(sigmas)
+        self.sigmas = self.shift * self.sigmas / (1 + (self.shift - 1) * self.sigmas)
+        self.timesteps = self.sigmas * self.num_train_timesteps
+        # Store all timesteps for TTM (same as KJ's all_timesteps)
+        self.all_timesteps = self.timesteps.clone()
+
+    def add_noise(self, original_samples, noise, timestep):
+        if timestep.ndim == 2:
+            timestep = timestep.flatten(0, 1)
+        self.sigmas = self.sigmas.to(noise.device)
+        self.timesteps = self.timesteps.to(noise.device)
+        timestep_id = torch.argmin((self.timesteps.unsqueeze(0) - timestep.unsqueeze(1)).abs(), dim=1)
+        sigma = self.sigmas[timestep_id].reshape(-1, 1, 1, 1)
+        sample = (1 - sigma) * original_samples + sigma * noise
+        return sample.type_as(noise)
+
+# Fallback Wan VAE latent stats (taken from official WanVideoVAE implementations)
+WAN_LATENT_STATS = {
+    16: {
+        "mean": torch.tensor(
+            [
+                -0.7571, -0.7089, -0.9113, 0.1075, -0.1745, 0.9653, -0.1517, 1.5508,
+                0.4134, -0.0715, 0.5517, -0.3632, -0.1922, -0.9497, 0.2503, -0.2921,
+            ],
+            dtype=torch.float32,
+        ).view(1, 16, 1, 1, 1),
+        "std": torch.tensor(
+            [
+                2.8184, 1.4541, 2.3275, 2.6558, 1.2196, 1.7708, 2.6052, 2.0743,
+                3.2687, 2.1526, 2.8652, 1.5579, 1.6382, 1.1253, 2.8251, 1.9160,
+            ],
+            dtype=torch.float32,
+        ).view(1, 16, 1, 1, 1),
+    },
+    48: {
+        "mean": torch.tensor(
+            [
+                -0.2289, -0.0052, -0.1323, -0.2339, -0.2799, 0.0174, 0.1838, 0.1557,
+                -0.1382, 0.0542, 0.2813, 0.0891, 0.1570, -0.0098, 0.0375, -0.1825,
+                -0.2246, -0.1207, -0.0698, 0.5109, 0.2665, -0.2108, -0.2158, 0.2502,
+                -0.2055, -0.0322, 0.1109, 0.1567, -0.0729, 0.0899, -0.2799, -0.1230,
+                -0.0313, -0.1649, 0.0117, 0.0723, -0.2839, -0.2083, -0.0520, 0.3748,
+                0.0152, 0.1957, 0.1433, -0.2944, 0.3573, -0.0548, -0.1681, -0.0667,
+            ],
+            dtype=torch.float32,
+        ).view(1, 48, 1, 1, 1),
+        "std": torch.tensor(
+            [
+                0.4765, 1.0364, 0.4514, 1.1677, 0.5313, 0.4990, 0.4818, 0.5013,
+                0.8158, 1.0344, 0.5894, 1.0901, 0.6885, 0.6165, 0.8454, 0.4978,
+                0.5759, 0.3523, 0.7135, 0.6804, 0.5833, 1.4146, 0.8986, 0.5659,
+                0.7069, 0.5338, 0.4889, 0.4917, 0.4069, 0.4999, 0.6866, 0.4093,
+                0.5709, 0.6065, 0.6415, 0.4944, 0.5726, 1.2042, 0.5458, 1.6887,
+                0.3971, 1.0600, 0.3943, 0.5537, 0.5444, 0.4089, 0.7468, 0.7744,
+            ],
+            dtype=torch.float32,
+        ).view(1, 48, 1, 1, 1),
+    },
+}
+
 
 class WanTTM_ModelFromUNet:
     """Wrap two Wan2.2 UNets (high/low noise) into MoE-ready models.
@@ -90,6 +179,108 @@ class WanTTM_Conditioning:
     provided out-of-band via a dict so the sampler can consume them explicitly.
     """
 
+    @staticmethod
+    def _resolve_latent_stats(vae):
+        """Best-effort search for Wan VAE latent mean/std on any wrapped object."""
+        def expand(obj):
+            attr_names = (
+                "config", "vae", "model", "inner_model", "first_stage_model",
+                "wrapped_model", "pipeline", "_model",
+            )
+            for name in attr_names:
+                child = getattr(obj, name, None)
+                if child is not None:
+                    yield child
+
+        seen = set()
+        queue = []
+
+        def enqueue(obj):
+            if obj is None:
+                return
+            obj_id = id(obj)
+            if obj_id in seen:
+                return
+            seen.add(obj_id)
+            queue.append(obj)
+
+        enqueue(vae)
+        enqueue(getattr(vae, "latent_format", None))
+
+        def extract_stats(obj):
+            mean = getattr(obj, "latents_mean", None)
+            std = getattr(obj, "latents_std", None)
+            inv_std = getattr(obj, "latents_inv_std", None)
+
+            if mean is None:
+                mean = getattr(obj, "mean", None)
+            if std is None:
+                std = getattr(obj, "std", None)
+            if inv_std is None:
+                inv_std = getattr(obj, "inv_std", None)
+
+            if std is None and inv_std is not None:
+                try:
+                    std_tensor = torch.as_tensor(inv_std, dtype=torch.float32)
+                    std = torch.where(std_tensor != 0, 1.0 / std_tensor, torch.ones_like(std_tensor))
+                except Exception:
+                    std = None
+
+            return mean, std
+
+        latents_mean = None
+        latents_std = None
+
+        while queue and (latents_mean is None or latents_std is None):
+            current = queue.pop(0)
+            candidate_mean, candidate_std = extract_stats(current)
+            if latents_mean is None and candidate_mean is not None:
+                latents_mean = candidate_mean
+            if latents_std is None and candidate_std is not None:
+                latents_std = candidate_std
+            for child in expand(current):
+                enqueue(child)
+
+        if latents_mean is None or latents_std is None:
+            latent_channels = (
+                getattr(vae, "latent_channels", None)
+                or getattr(getattr(vae, "model", None), "z_dim", None)
+                or getattr(vae, "z_dim", None)
+            )
+            if latent_channels is None and hasattr(vae, "get_latent_channels"):
+                try:
+                    latent_channels = vae.get_latent_channels()
+                except Exception:
+                    latent_channels = None
+            if latent_channels is not None:
+                stats = WAN_LATENT_STATS.get(int(latent_channels))
+                if stats is not None:
+                    latents_mean = stats["mean"]
+                    latents_std = stats["std"]
+
+        return latents_mean, latents_std
+
+    @classmethod
+    def _normalize_reference_latents(cls, latents: torch.Tensor, vae) -> torch.Tensor:
+        mean_values, std_values = cls._resolve_latent_stats(vae)
+        if mean_values is None or std_values is None:
+            print("[WanTTM Conditioning] WARNING: VAE latents_mean/std not found, skipping ref latent normalization.")
+            return latents
+
+        mean_tensor = torch.as_tensor(mean_values, dtype=latents.dtype, device=latents.device)
+        std_tensor = torch.as_tensor(std_values, dtype=latents.dtype, device=latents.device)
+        if mean_tensor.numel() != latents.shape[1] or std_tensor.numel() != latents.shape[1]:
+            print("[WanTTM Conditioning] WARNING: VAE latent stats have unexpected size, skipping normalization.")
+            return latents
+
+        mean_tensor = mean_tensor.view(1, -1, 1, 1, 1).to(latents.device, latents.dtype)
+        std_tensor = std_tensor.view(1, -1, 1, 1, 1).to(latents.device, latents.dtype)
+        std_tensor = torch.where(std_tensor == 0, torch.ones_like(std_tensor), std_tensor)
+        inv_std = torch.reciprocal(std_tensor)
+        latents = (latents - mean_tensor) * inv_std
+        latents._wan_stats = (mean_tensor, std_tensor)
+        return latents
+
     @classmethod
     def INPUT_TYPES(cls):
         return {
@@ -149,6 +340,8 @@ class WanTTM_Conditioning:
             raise ValueError(f"{label} must be 4D or 5D tensor, got {video.ndim}D")
 
         # --- Encode motion signal video -------------------------------------------------
+        # Official TTM: motion_signal_video is encoded to get ref_latents
+        # The VAE has temporal stride 4, so T frames -> (T-1)//4 + 1 latent frames
         motion_video = ensure_batched(motion_signal_video, "motion_signal_video")
         print(f"[WanTTM Conditioning] motion_signal_video input shape: {tuple(motion_signal_video.shape)}")
 
@@ -166,23 +359,42 @@ class WanTTM_Conditioning:
         # Handle both 4D [B*T,C,h,w] and 5D [B,C,T,h,w] returns
         B = motion_video.shape[0]
         if motion_latent.dim() == 5:
-            # Already [B,C,T,h,w] or [1,C,T,h,w]
+            # Already [B,C,T',h,w] where T' is VAE-encoded temporal dimension
             h, w = motion_latent.shape[3:]
+            T_encoded = motion_latent.shape[2]
         elif motion_latent.dim() == 4:
             # [B*T,C,h,w] -> [B,T,C,h,w] -> [B,C,T,h,w]
+            # But VAE may have temporal stride, so T might be different
             C = motion_latent.shape[1]
             h, w = motion_latent.shape[2:]
-            motion_latent = motion_latent.reshape(B, T, C, h, w).permute(0, 2, 1, 3, 4).contiguous()
+            # VAE temporal stride: if input is T frames, output is (T-1)//4 + 1 frames
+            T_encoded = (T - 1) // 4 + 1
+            if motion_latent.shape[0] == B * T:
+                # VAE didn't apply temporal stride, reshape normally
+                motion_latent = motion_latent.reshape(B, T, C, h, w).permute(0, 2, 1, 3, 4).contiguous()
+                T_encoded = T
+            else:
+                # VAE applied temporal stride, need to handle differently
+                # Assume VAE output is [B*T_encoded, C, h, w]
+                motion_latent = motion_latent.reshape(B, T_encoded, C, h, w).permute(0, 2, 1, 3, 4).contiguous()
         else:
             raise ValueError(f"Unexpected motion_latent dim={motion_latent.dim()}, shape={motion_latent.shape}")
 
         # Temporal length in latent space (Wan uses stride 4 in time)
+        # This is the target number of latent frames for the output video
         latent_frames = (num_frames - 1) // 4 + 1
+        print(f"[WanTTM Conditioning] motion_latent encoded frames: {T_encoded}, target latent_frames: {latent_frames}")
+        
+        # Align motion_latent to target latent_frames
         if motion_latent.shape[2] > latent_frames:
+            # Trim to target length
             motion_latent = motion_latent[:, :, :latent_frames]
+            print(f"[WanTTM Conditioning] Trimmed motion_latent from {T_encoded} to {latent_frames} frames")
         elif motion_latent.shape[2] < latent_frames:
+            # Pad to target length (repeat last frame)
             pad = latent_frames - motion_latent.shape[2]
-            motion_latent = torch.cat([motion_latent, motion_latent[:, :, :pad]], dim=2)
+            motion_latent = torch.cat([motion_latent, motion_latent[:, :, -1:].repeat(1, 1, pad, 1, 1)], dim=2)
+            print(f"[WanTTM Conditioning] Padded motion_latent from {T_encoded} to {latent_frames} frames")
 
         # --- Encode start_image to get initial latent -----------------------------------
         start = ensure_batched(start_image, "start_image")
@@ -210,12 +422,14 @@ class WanTTM_Conditioning:
         # Allocate latent: [B,16,latent_frames,h,w]
         batch_size = start_latent.shape[0]
         
-        # TTM approach: Initialize with start_image for all frames
-        # This provides a clean base for background regions
+        # Official TTM: Initial latent comes from motion_signal (ref_latents), not start_image
+        # The start_image is locked via I2V concat_latent_image + concat_mask mechanism
+        # So we initialize latent with motion_latent shape, but actual initialization happens in sampler
+        # For now, we create a placeholder - the sampler will replace it with noisy ref_latents
         latent = start_latent.to(device).expand(-1, -1, latent_frames, -1, -1).clone()
         
-        print(f"[WanTTM Conditioning] Latent shape: {latent.shape} (all frames from start_image)")
-        print(f"[WanTTM Conditioning] Note: TTM will replace frames 2-21 with noisy motion signal during sampling")
+        print(f"[WanTTM Conditioning] Latent shape: {latent.shape} (placeholder - will be replaced by noisy motion_signal in sampler)")
+        print(f"[WanTTM Conditioning] Note: Start image is locked via I2V concat_latent_image + concat_mask mechanism")
 
         # --- Process motion mask --------------------------------------------------------
         # motion_signal_mask: IMAGE [B,H,W,C] - convert to grayscale mask [T,H,W]
@@ -313,12 +527,16 @@ class WanTTM_Conditioning:
 
         # Prepare TTM params dict for the sampler
         # motion_latent: [B,C,T,h,w] -> reference: take batch 0
-        ttm_reference_latents = motion_latent[0].detach()
+        ref_latents = motion_latent[:1].detach()
+        ref_latents = cls._normalize_reference_latents(ref_latents, vae)
+        ref_stats = getattr(ref_latents, "_wan_stats", None)
+        ttm_reference_latents = ref_latents.squeeze(0).contiguous()
         ttm_params = {
             "ttm_reference_latents": ttm_reference_latents,  # [C,T,h,w]
             "ttm_mask": ttm_mask.detach(),                  # [T,1,h,w]
             "ttm_start_step": int(ttm_start_step),
             "ttm_end_step": int(ttm_end_step),
+            "ttm_ref_stats": ref_stats,
         }
 
         # Use ComfyUI Wan's I2V mechanism: concat_latent_image + concat_mask
@@ -428,11 +646,27 @@ class WanTTM_Sampler:
         
         print(f"[WanTTM] Initial latent: {latent_image.shape}")
 
-        sigmas = comfy.samplers.calculate_sigmas(
-            model_high.get_model_object("model_sampling"),
-            scheduler,
-            steps
-        ).to(device=device, dtype=latent_image.dtype)
+        # Construct Wan FlowMatch scheduler (aligned with KJ's implementation)
+        sampling_high = model_high.get_model_object("model_sampling")
+        shift = getattr(sampling_high, "flow_shift", 3.0)
+        sigma_max = getattr(sampling_high, "sigma_max", 1.0)
+        sigma_min = getattr(sampling_high, "sigma_min", 0.003 / 1.002)
+        train_steps = getattr(sampling_high, "flow_train_steps", 1000)
+        
+        # Initialize FlowMatch scheduler (same as KJ's WanVideoWrapper)
+        flow_scheduler = FlowMatchSchedulerResMultistep(
+            num_inference_steps=steps,
+            num_train_timesteps=int(train_steps),
+            shift=float(shift),
+            sigma_max=float(sigma_max),
+            sigma_min=float(sigma_min),
+            extra_one_step=False
+        )
+        flow_scheduler.sigmas = flow_scheduler.sigmas.to(device=device, dtype=latent_image.dtype)
+        flow_scheduler.timesteps = flow_scheduler.timesteps.to(device=device, dtype=latent_image.dtype)
+        sigmas = flow_scheduler.sigmas
+        print(f"[WanTTM] Flow sigmas ({len(sigmas)}): {sigmas.tolist()}")
+        print(f"[WanTTM] Flow timesteps ({len(flow_scheduler.timesteps)}): {flow_scheduler.timesteps.tolist()}")
         use_flow_sampler = scheduler == FLOW_SCHEDULER_NAME
 
         # Prepare TTM data (optional)
@@ -442,7 +676,10 @@ class WanTTM_Sampler:
         ttm_reference_latents = ttm_params.get("ttm_reference_latents")
         ttm_mask = ttm_params.get("ttm_mask")
         tweak_index = int(ttm_params.get("ttm_start_step", 0))  # When background starts
-        tstrong_index = int(ttm_params.get("ttm_end_step", 0))  # When motion starts
+        tstrong_index = int(ttm_params.get("ttm_end_step", steps))  # When motion stops
+        if tstrong_index > steps:
+            print(f"[WanTTM] WARNING: ttm_end_step {tstrong_index} exceeds total steps {steps}. Clamping to {steps}.")
+            tstrong_index = steps
         
         # Check if TTM is enabled
         ttm_enabled = (ttm_reference_latents is not None and 
@@ -458,7 +695,7 @@ class WanTTM_Sampler:
             ref = ttm_reference_latents.to(device)
             if ref.dim() == 4:
                 ref = ref.unsqueeze(0)
-            
+
             ref = comfy.sample.fix_empty_latent_channels(model_high, ref)
             latent_format = model_high.get_model_object("latent_format")
             if latent_format is not None:
@@ -477,7 +714,7 @@ class WanTTM_Sampler:
             print(f"[WanTTM] Mask after reshape: {mask.shape}")
             
             # Expand to match ref dimensions [B,C,T,h,w]
-            motion_mask = mask.expand(ref.shape[0], ref.shape[1], -1, -1, -1)
+            motion_mask = mask.expand(ref.shape[0], ref.shape[1], -1, -1, -1).to(ref)
             background_mask = 1.0 - motion_mask
             
             # Debug mask info
@@ -498,52 +735,37 @@ class WanTTM_Sampler:
                 if mask_variance < 1e-6:
                     print(f"[WanTTM] WARNING: Mask is STATIC across frames (variance={mask_variance:.2e})")
             
-            # Generate fixed noise for motion signal
-            fixed_noise = comfy.sample.prepare_noise(ref, seed + 1, None).to(device=device, dtype=ref.dtype)
-
-            sampling_high = model_high.get_model_object("model_sampling")
-
-            def noisy_reference_at_step(step_index: int):
-                if step_index < 0:
-                    step_index = 0
-                if step_index >= len(sigmas):
-                    return ref
-                sigma_value = sigmas[step_index]
-                sigma_value = sigma_value.view(1)
-                noise_clone = fixed_noise.clone()
-                return sampling_high.noise_scaling(sigma_value, noise_clone, ref, max_denoise=False)
-            
-            # TTM Original Initialization:
-            # ALL frames = motion_signal + noise (including frame 1)
-            # Frame 1 will be locked by I2V concat_mask mechanism in conditioning
-            if tweak_index >= 0 and tweak_index < len(sigmas):
-                tweak_sigma = sigmas[tweak_index].item()
-                print(f"[WanTTM] Initializing at tweak_index={tweak_index}, sigma={tweak_sigma:.3f}")
-
-                # TTM original: entire latent = ref_latents + fixed_noise (Flow-aware)
-                latent_image = noisy_reference_at_step(tweak_index)
-                
-                print(f"[WanTTM]   ALL frames initialized as: motion_signal + noise (sigma={tweak_sigma:.3f})")
-                print(f"[WanTTM]   Frame 1: will be locked by I2V concat_mask mechanism")
-                print(f"[WanTTM]   Frames 2-21: will denoise from motion_signal")
-                print(f"[WanTTM]   During denoising [tweak={tweak_index}, tstrong={tstrong_index}):")
-                print(f"[WanTTM]     - Background: denoises from motion_signal background")
-                print(f"[WanTTM]     - Motion: replaced with noisy motion_signal (TTM dual clock)")
-            else:
-                print(f"[WanTTM] Warning: tweak_index={tweak_index} out of range, using original latent")
+            # Note: TTM initialization will happen after noise is prepared (see below)
             
         else:
             print(f"[WanTTM] TTM disabled, running standard MoE sampling")
             ref = None
-            fixed_noise = None
             motion_mask = None
             background_mask = None
-            sampling_high = None
         
         # Prepare noise ONCE for both phases (critical!)
         batch_inds = latent.get("batch_index", None)
         noise = comfy.sample.prepare_noise(latent_image, seed, batch_inds).to(device)
         noise_mask = latent.get("noise_mask")
+        
+        # TTM initialization: 
+        # - Initial latent comes from start_image (via I2V concat_latent_image mechanism)
+        # - Motion signal is used as reference for dynamic guidance during sampling
+        # - We prepare fixed_noise for TTM injection, but don't replace initial latent
+        # Official implementation replaces latent with noisy ref_latents, but that causes issues
+        # because motion_signal may contain full frames (jelly effect), not just motion info
+        if ttm_enabled and tweak_index >= 0 and tweak_index < len(flow_scheduler.timesteps):
+            # Generate fixed_noise for TTM (same shape as ref_latents)
+            # This will be used during sampling to inject noisy motion_signal in motion regions
+            import torch
+            fixed_noise = torch.randn_like(ref)
+            # Store fixed_noise for TTM injection during sampling
+            ttm_fixed_noise = fixed_noise
+            print(f"[WanTTM] TTM enabled: motion_signal will be injected during sampling via mask")
+            print(f"[WanTTM] Initial latent from start_image (locked via I2V concat_mask)")
+            print(f"[WanTTM] Motion guidance active from step {tweak_index} to {tstrong_index}")
+        else:
+            ttm_fixed_noise = None
         
         # Determine MoE switching point
         switch_step_clamped = min(max(switch_step, 0), steps - 1)
@@ -555,29 +777,87 @@ class WanTTM_Sampler:
             print(f"[WanTTM] Phase 2: LOW model [{switch_step_clamped}, {steps}], CFG={cfg_low}")
         
         # TTM Dual Clock + preview callback
+        # Official implementation: loop starts from tweak_index, so we need to adjust step indexing
         step_offset = [0]  # Track global step across phases
+        phase_start_step = [0]  # Track where current phase starts in the full timestep array
 
-        def sampler_callback(step, x0, x, total_steps_phase):
+        def sampler_callback(*args, **kwargs):
+            """Unified callback that handles both FlowMatch (dict) and KSampler (tuple) formats.
+            
+            Official TTM logic:
+            - Loop: for i, t in enumerate(timesteps[tweak_index:])
+            - i=0 corresponds to timesteps[tweak_index] (first step after initialization)
+            - TTM injection uses: timesteps[i+tweak_index+1] (next timestep)
+            - Condition: (i+tweak_index) < tstrong_index
+            """
+            # FlowMatch format: callback({"i": i, "x": x, ...})
+            if len(args) == 1 and isinstance(args[0], dict):
+                data = args[0]
+                step = data["i"]  # Loop index within current phase (0-based)
+                x = data["x"]  # This is the latent AFTER step (in-place modifiable)
+                x0_approx = data.get("denoised", x)  # noise_pred for preview
+            # KSampler format: callback(step, x0, x, total_steps)
+            elif len(args) == 4:
+                step, x0_approx, x, _ = args
+            else:
+                return  # Unknown format, skip
+            
+            # Calculate absolute step index in the full timestep array
+            # phase_start_step[0] is where current phase starts (0 for phase 1, switch_step for phase 2)
+            # step is the loop index within current phase (0-based)
+            # For TTM: we need to know if we're in the TTM range [tweak_index, tstrong_index)
+            absolute_step = phase_start_step[0] + step
             global_step = step_offset[0] + step
 
-            if ttm_enabled and tweak_index <= global_step < tstrong_index:
-                next_step = min(global_step + 1, len(sigmas) - 1)
-                noisy_ref = noisy_reference_at_step(next_step)
-                x.mul_(background_mask).add_(noisy_ref * motion_mask)
-
-                if global_step == tweak_index:
+            # TTM injection happens AFTER scheduler.step, using NEXT step's timestep
+            # TTM mechanism: 
+            # - Background regions: keep denoised result (normal denoising)
+            # - Motion regions: replace with noisy motion_signal (dynamic guidance)
+            # - First frame: locked via I2V concat_mask mechanism
+            if ttm_enabled and tweak_index <= absolute_step < tstrong_index:
+                # Calculate next timestep index (same as official: i+tweak_index+1)
+                next_timestep_idx = absolute_step + 1
+                if next_timestep_idx < len(flow_scheduler.all_timesteps):
+                    # Use FlowMatch scheduler's add_noise with the correct timestep (same as official)
+                    timestep_value = flow_scheduler.all_timesteps[next_timestep_idx].item()
+                    timestep_tensor = torch.tensor([timestep_value], device=ref.device, dtype=torch.long).view(1)
+                    # Flatten temporal dim for add_noise: [B,C,T,H,W] -> [B*T,C,H,W]
+                    B, C, T, H, W = ref.shape
+                    ref_flat = ref.permute(0, 2, 1, 3, 4).contiguous().view(B * T, C, H, W)
+                    # Use fixed_noise (same as official, not the sampling noise)
+                    fixed_noise_flat = ttm_fixed_noise.permute(0, 2, 1, 3, 4).contiguous().view(B * T, C, H, W)
+                    timestep_expanded = timestep_tensor.expand(B * T).long()
+                    noisy_flat = flow_scheduler.add_noise(ref_flat, fixed_noise_flat, timestep_expanded)
+                    noisy_ref = noisy_flat.view(B, T, C, H, W).permute(0, 2, 1, 3, 4).contiguous().to(x.device).to(x.dtype)
+                else:
+                    # Fallback to clean reference (same as official's else branch)
+                    noisy_ref = ref.to(x.device).to(x.dtype)
+                
+                # Apply TTM dual clock: background keeps denoised, motion gets noisy reference
+                # Same as official: latents = latents * background_mask + noisy_latents * motion_mask
+                # Ensure masks are on correct device and dtype
+                bg_mask = background_mask.to(device=x.device, dtype=x.dtype)
+                mot_mask = motion_mask.to(device=x.device, dtype=x.dtype)
+                
+                # Debug: check mask coverage
+                if absolute_step == tweak_index:
+                    motion_coverage = (mot_mask > 0.5).float().mean().item()
                     print(f"[WanTTM] TTM Dual Clock active: steps [{tweak_index}, {tstrong_index})")
-                    print(f"[WanTTM]   Background: normal denoising from motion_signal")
-                    print(f"[WanTTM]   Motion region: replaced with noisy motion_signal")
+                    print(f"[WanTTM]   Motion mask coverage: {motion_coverage:.1%}")
+                    print(f"[WanTTM]   Background: normal denoising (keeps denoised result)")
+                    print(f"[WanTTM]   Motion region: replaced with noisy motion_signal (timestep={flow_scheduler.all_timesteps[next_timestep_idx].item():.1f})")
                     print(f"[WanTTM]   (Frame 1 locked by I2V concat_mask)")
+                
+                # Apply mask: x = x * bg_mask + noisy_ref * mot_mask
+                x.mul_(bg_mask).add_(noisy_ref * mot_mask)
 
             if preview_callback is not None:
-                preview_callback(global_step, x0, x, steps)
+                preview_callback(global_step, x0_approx, x, steps)
         
-        def run_flow_phase(model, cfg_scale, pos_cond, neg_cond, sigmas_tensor, disable_noise_flag, force_zero_end_flag, latent_in, phase_steps):
+        def run_flow_phase(model, cfg_scale, pos_cond, neg_cond, sigmas_tensor, disable_noise_flag, force_zero_end_flag, latent_in, phase_steps, enable_callback):
             phase_cb = None
-            if sampler_callback is not None:
-                phase_cb = lambda data: sampler_callback(data["i"], data["denoised"], data["x"], phase_steps)
+            if sampler_callback is not None and enable_callback:
+                phase_cb = sampler_callback  # Direct pass, no wrapper needed
             return sample_flowmatch(
                 model=model,
                 noise=noise,
@@ -595,10 +875,30 @@ class WanTTM_Sampler:
             )
 
         # Phase 1
+        # Official TTM: if tweak_index > 0, loop starts from tweak_index, not 0
+        # Official: for i, t in enumerate(timesteps[tweak_index:])
+        #   - i=0 corresponds to timesteps[tweak_index] (first step after initialization)
+        #   - The loop processes timesteps[tweak_index] to the end
+        # In our case: sample_flowmatch processes sigmas[0] to sigmas[-1]
+        #   - If tweak_index > 0, we need to start from sigmas[tweak_index]
+        #   - But initialization already uses timesteps[tweak_index], so the first loop step
+        #     should denoise from timesteps[tweak_index] to the next timestep
         if use_flow_sampler:
-            sigmas_high = sigmas[:switch_step_clamped + 1].clone()
+            # For TTM: if tweak_index > 0, we skip the first tweak_index sigmas
+            # This matches official: loop starts from timesteps[tweak_index]
+            if ttm_enabled and tweak_index > 0:
+                # Start from tweak_index: only process sigmas from tweak_index onwards
+                # Note: sigmas[tweak_index] corresponds to the timestep used in initialization
+                sigmas_high = sigmas[tweak_index:switch_step_clamped + 1].clone()
+                phase_start_step[0] = tweak_index
+            else:
+                sigmas_high = sigmas[:switch_step_clamped + 1].clone()
+                phase_start_step[0] = 0
             if not has_phase_2:
-                sigmas_high = sigmas.clone()
+                if ttm_enabled and tweak_index > 0:
+                    sigmas_high = sigmas[tweak_index:].clone()
+                else:
+                    sigmas_high = sigmas.clone()
             total_steps_phase = len(sigmas_high) - 1
             latent_image = run_flow_phase(
                 model_high,
@@ -610,6 +910,7 @@ class WanTTM_Sampler:
                 force_zero_end_flag=has_phase_2,
                 latent_in=latent_image,
                 phase_steps=total_steps_phase,
+                enable_callback=True,
             )
         else:
             latent_image = comfy.sample.fix_empty_latent_channels(model_high, latent_image)
@@ -632,6 +933,7 @@ class WanTTM_Sampler:
             step_offset[0] = switch_step_clamped
             if use_flow_sampler:
                 sigmas_low = sigmas[switch_step_clamped:].clone()
+                phase_start_step[0] = switch_step_clamped
                 total_steps_low = len(sigmas_low) - 1
                 latent_image = run_flow_phase(
                     model_low,
@@ -643,6 +945,7 @@ class WanTTM_Sampler:
                     force_zero_end_flag=True,
                     latent_in=latent_image,
                     phase_steps=total_steps_low,
+                    enable_callback=ttm_enabled,
                 )
             else:
                 latent_image = comfy.sample.fix_empty_latent_channels(model_low, latent_image)
@@ -655,11 +958,23 @@ class WanTTM_Sampler:
                     last_step=steps,
                     force_full_denoise=False,
                     noise_mask=noise_mask,
-                    callback=sampler_callback,
+                    callback=sampler_callback if ttm_enabled else None,
                     disable_pbar=False,
                     seed=seed
                 )
         
+        if ttm_enabled:
+            ref_stats = ttm_params.get("ttm_ref_stats")
+            if ref_stats is not None:
+                mean_tensor, std_tensor = ref_stats
+                if mean_tensor is not None and std_tensor is not None:
+                    mean_tensor = mean_tensor.to(device=latent_image.device, dtype=latent_image.dtype)
+                    std_tensor = std_tensor.to(device=latent_image.device, dtype=latent_image.dtype)
+                    std_tensor = torch.where(std_tensor == 0, torch.ones_like(std_tensor), std_tensor)
+                    local_motion_mask = motion_mask.to(device=latent_image.device, dtype=latent_image.dtype)
+                    denorm = latent_image * std_tensor + mean_tensor
+                    latent_image = latent_image * (1.0 - local_motion_mask) + denorm * local_motion_mask
+
         out = latent.copy()
         out["samples"] = latent_image
         print(f"[WanTTM] Sampling complete. Output shape: {latent_image.shape}")
