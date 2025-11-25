@@ -422,14 +422,15 @@ class WanTTM_Conditioning:
         # Allocate latent: [B,16,latent_frames,h,w]
         batch_size = start_latent.shape[0]
         
-        # Official TTM: Initial latent comes from motion_signal (ref_latents), not start_image
-        # The start_image is locked via I2V concat_latent_image + concat_mask mechanism
-        # So we initialize latent with motion_latent shape, but actual initialization happens in sampler
-        # For now, we create a placeholder - the sampler will replace it with noisy ref_latents
+        # Official TTM logic:
+        # - Initial latent will be REPLACED in sampler with noisy ref_latents (from motion_signal_video)
+        # - start_image is used via I2V concat_latent_image mechanism to lock first frame
+        # - For now, create a placeholder with correct shape (will be replaced in sampler if TTM enabled)
         latent = start_latent.to(device).expand(-1, -1, latent_frames, -1, -1).clone()
         
-        print(f"[WanTTM Conditioning] Latent shape: {latent.shape} (placeholder - will be replaced by noisy motion_signal in sampler)")
-        print(f"[WanTTM Conditioning] Note: Start image is locked via I2V concat_latent_image + concat_mask mechanism")
+        print(f"[WanTTM Conditioning] Latent shape: {latent.shape}")
+        print(f"[WanTTM Conditioning] Note: If TTM enabled, initial latent will be replaced with noisy motion_signal in sampler")
+        print(f"[WanTTM Conditioning] Start image locked via I2V concat_latent_image + concat_mask mechanism")
 
         # --- Process motion mask --------------------------------------------------------
         # motion_signal_mask: IMAGE [B,H,W,C] - convert to grayscale mask [T,H,W]
@@ -748,21 +749,25 @@ class WanTTM_Sampler:
         noise = comfy.sample.prepare_noise(latent_image, seed, batch_inds).to(device)
         noise_mask = latent.get("noise_mask")
         
-        # TTM initialization: 
-        # - Initial latent comes from start_image (via I2V concat_latent_image mechanism)
-        # - Motion signal is used as reference for dynamic guidance during sampling
-        # - We prepare fixed_noise for TTM injection, but don't replace initial latent
-        # Official implementation replaces latent with noisy ref_latents, but that causes issues
-        # because motion_signal may contain full frames (jelly effect), not just motion info
+        # TTM initialization (aligned with official implementation):
+        # Official TTM: When tweak_index >= 0, initial latents are REPLACED with noisy ref_latents
+        # The start_image is still used via I2V concat_latent_image mechanism to lock first frame
         if ttm_enabled and tweak_index >= 0 and tweak_index < len(flow_scheduler.timesteps):
             # Generate fixed_noise for TTM (same shape as ref_latents)
-            # This will be used during sampling to inject noisy motion_signal in motion regions
             import torch
             fixed_noise = torch.randn_like(ref)
-            # Store fixed_noise for TTM injection during sampling
             ttm_fixed_noise = fixed_noise
-            print(f"[WanTTM] TTM enabled: motion_signal will be injected during sampling via mask")
-            print(f"[WanTTM] Initial latent from start_image (locked via I2V concat_mask)")
+            
+            # Official implementation: Replace initial latent with noisy ref_latents at tweak_index
+            tweak_timestep = flow_scheduler.timesteps[tweak_index]
+            tweak_tensor = torch.as_tensor(tweak_timestep, device=ref.device, dtype=torch.long).view(1)
+            noisy_ref_latents = flow_scheduler.add_noise(ref, fixed_noise, tweak_tensor.long())
+            
+            # Replace latent_image with noisy ref_latents (official TTM behavior)
+            latent_image = noisy_ref_latents.to(dtype=latent_image.dtype, device=latent_image.device)
+            
+            print(f"[WanTTM] TTM enabled: Initial latent REPLACED with noisy motion_signal at tweak_index={tweak_index}")
+            print(f"[WanTTM] Start image locked via I2V concat_latent_image mechanism")
             print(f"[WanTTM] Motion guidance active from step {tweak_index} to {tstrong_index}")
         else:
             ttm_fixed_noise = None
