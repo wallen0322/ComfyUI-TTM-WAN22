@@ -160,6 +160,9 @@ class FlowEulerSamplerTTM(comfy.samplers.Sampler):
                 })
 
         # Final inverse scaling
+        # CRITICAL: If disable_noise=True and we started with a pre-scaled latent (e.g., TTM),
+        # we may need to skip inverse_noise_scaling or handle it differently.
+        # For now, always apply inverse_noise_scaling as it's required by FlowMatch models.
         samples = model_wrap.inner_model.model_sampling.inverse_noise_scaling(sigmas[-1], x)
         return samples
 

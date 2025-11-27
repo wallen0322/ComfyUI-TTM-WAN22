@@ -669,6 +669,7 @@ class WanTTM_Sampler:
         motion_mask = None
         background_mask = None
         fixed_noise = None
+        sampling_high = None
         
         if ttm_enabled:
             print(f"[WanTTM] TTM Dual Clock ENABLED")
@@ -687,6 +688,9 @@ class WanTTM_Sampler:
             latent_format = model_high.get_model_object("latent_format")
             if latent_format is not None:
                 ref = latent_format.process_in(ref)
+            
+            # Get model_sampling for noise_scaling in TTM injection
+            sampling_high = model_high.get_model_object("model_sampling")
             
             print(f"[WanTTM] Reference latent: {ref.shape}, range: [{ref.min():.3f}, {ref.max():.3f}]")
             
@@ -715,8 +719,25 @@ class WanTTM_Sampler:
             fixed_noise = torch.randn_like(ref)
             
             # TTM Initialization: Replace initial latent with noisy reference at sigma[tweak_index]
+            # CRITICAL: Use noise_scaling to ensure compatibility with inverse_noise_scaling
+            # noise_scaling expects: (sigma, noise, clean_latent, max_denoise)
+            # It combines clean_latent and noise at the given sigma, applying FlowMatch scaling
             sigma_init = sigmas[tweak_index].item()
-            latent_image = add_noise_at_sigma(ref, fixed_noise, sigma_init)
+            sampling_high = model_high.get_model_object("model_sampling")
+            
+            if hasattr(sampling_high, "noise_scaling"):
+                # Use noise_scaling with clean ref and fixed_noise to create properly scaled noisy latent
+                sigma_tensor = torch.tensor(sigma_init, device=ref.device, dtype=ref.dtype)
+                latent_image = sampling_high.noise_scaling(
+                    sigma_tensor,
+                    fixed_noise,
+                    ref,  # clean reference latent
+                    True  # max_denoise
+                )
+            else:
+                # Fallback: use add_noise_at_sigma (may cause issues with inverse_noise_scaling)
+                latent_image = add_noise_at_sigma(ref, fixed_noise, sigma_init)
+                print(f"[WanTTM] WARNING: model_sampling.noise_scaling not found, using add_noise_at_sigma")
             
             print(f"[WanTTM] Initialized latent with noisy ref at sigma={sigma_init:.4f}")
             print(f"[WanTTM] Latent range after init: [{latent_image.min():.3f}, {latent_image.max():.3f}]")
@@ -760,10 +781,20 @@ class WanTTM_Sampler:
             # TTM injection: apply in range [tweak_index, tstrong_index)
             if ttm_enabled and tweak_index <= global_step < tstrong_index:
                 # Calculate noisy reference at sigma_next
-                # This is the core TTM formula: noisy = (1-sigma)*clean + sigma*noise
+                # CRITICAL: Use noise_scaling to ensure compatibility with FlowMatch's internal representation
                 sigma_val = float(sigma_next) if not torch.is_tensor(sigma_next) else sigma_next.item()
                 
-                if sigma_val > 0:
+                if sigma_val > 0 and sampling_high is not None and hasattr(sampling_high, "noise_scaling"):
+                    # Use noise_scaling to create properly scaled noisy reference
+                    sigma_tensor = torch.tensor(sigma_val, device=ref.device, dtype=ref.dtype)
+                    noisy_ref = sampling_high.noise_scaling(
+                        sigma_tensor,
+                        fixed_noise.to(device=ref.device, dtype=ref.dtype),
+                        ref,
+                        True  # max_denoise
+                    )
+                elif sigma_val > 0:
+                    # Fallback: use add_noise_at_sigma
                     noisy_ref = add_noise_at_sigma(ref, fixed_noise, sigma_val)
                 else:
                     # sigma=0 means clean reference

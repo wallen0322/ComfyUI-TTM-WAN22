@@ -18,6 +18,10 @@ from .nodes_ttm_clean import (
     WanTTM_Sampler_Clean,
 )
 
+from .nodes_ttm_exact import (
+    WanTTM_Sampler_Exact,
+)
+
 
 NODE_CLASS_MAPPINGS = {
     # Original nodes
@@ -28,6 +32,8 @@ NODE_CLASS_MAPPINGS = {
     # Clean TTM nodes (extracted from KJ)
     "WanTTM_PrepareLatents": WanTTM_PrepareLatents,
     "WanTTM_Sampler_Clean": WanTTM_Sampler_Clean,
+    # Exact TTM node
+    "WanTTM_Sampler_Exact": WanTTM_Sampler_Exact,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -38,4 +44,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     # Clean TTM nodes
     "WanTTM_PrepareLatents": "TTM: Prepare Latents (Clean)",
     "WanTTM_Sampler_Clean": "TTM: Sampler (Clean)",
+    # Exact TTM node
+    "WanTTM_Sampler_Exact": "TTM: Sampler (Exact Reproduction)",
 }
