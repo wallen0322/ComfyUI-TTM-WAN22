@@ -380,91 +380,79 @@ class WanTTM_Sampler_Clean:
         ttm_end_step,
         callback,
     ):
-        """Manual sampling loop with TTM injection."""
+        """Use ComfyUI's sampler with TTM callback injection."""
         device = mm.get_torch_device()
         
-        # Move everything to device
-        x = latent.to(device)
+        # Move TTM components to device
         ref = ref.to(device)
         motion_mask = motion_mask.to(device)
         background_mask = 1.0 - motion_mask
         noise = noise.to(device)
-        sigmas = sigmas.to(device)
         
-        # Initialize with noisy reference if starting from step 0
-        if ttm_start_step == 0:
-            sigma_init = sigmas[0].item()
-            x = add_noise_at_sigma(ref, noise, sigma_init)
-            print(f"[TTM] Initialized with noisy ref at sigma={sigma_init:.4f}")
-        else:
-            # Start from noisy latent
-            x = add_noise_at_sigma(x, noise, sigmas[0].item())
+        # TTM state
+        step_counter = [0]
         
-        # Get model function
-        mm.load_model_gpu(model)
-        model_patcher = model
-        real_model = model_patcher.model
-        
-        # Prepare model wrapper
-        model_options = model_patcher.model_options.copy()
-        
-        # Calculate cond
-        positive_copy = comfy.samplers.convert_cond(positive)
-        negative_copy = comfy.samplers.convert_cond(negative)
-        
-        total_steps = len(sigmas) - 1
-        pbar = comfy.utils.ProgressBar(total_steps)
-        
-        for i in range(total_steps):
-            sigma = sigmas[i]
-            sigma_next = sigmas[i + 1]
+        # Create TTM callback wrapper
+        def ttm_callback(step, x, x_denoised, total_steps):
+            current_step = step_counter[0]
             
-            # CFG sampling: calc_cond_batch returns denoised prediction
-            sigma_batch = sigma.unsqueeze(0).expand(x.shape[0])
-            
-            # Compute denoised with CFG (comfy handles CFG internally if both conds provided)
-            # But for manual CFG, we need to call separately
-            cond_denoised = comfy.samplers.calc_cond_batch(
-                model_patcher, positive_copy, x, sigma_batch, model_options
-            )
-            uncond_denoised = comfy.samplers.calc_cond_batch(
-                model_patcher, negative_copy, x, sigma_batch, model_options
-            )
-            
-            # CFG combination on denoised predictions
-            denoised = uncond_denoised + cfg * (cond_denoised - uncond_denoised)
-            
-            # Euler step (k-diffusion style):
-            # d = (x - denoised) / sigma  (velocity/direction)
-            # x_next = x + d * dt
-            d = (x - denoised) / sigma
-            dt = sigma_next - sigma
-            x = x + d * dt
-            
-            # TTM injection: after euler step
-            if ttm_start_step <= i < ttm_end_step:
+            # Apply TTM injection after each step
+            if ttm_start_step <= current_step < ttm_end_step:
+                # Get current sigma for this step
+                sigma_next = sigmas[current_step + 1].item() if current_step + 1 < len(sigmas) else 0.0
+                
                 # Compute noisy reference at next sigma
-                noisy_ref = add_noise_at_sigma(ref, noise, sigma_next.item())
-                # Blend: background keeps denoised, motion gets noisy ref
-                x = x * background_mask + noisy_ref * motion_mask
-                print(f"[TTM] Step {i}: injected at sigma_next={sigma_next.item():.4f}")
+                noisy_ref = add_noise_at_sigma(ref, noise, sigma_next)
+                
+                # Blend in-place: background keeps denoised, motion gets noisy ref
+                x.mul_(background_mask).add_(noisy_ref * motion_mask)
+                
+                print(f"[TTM] Step {current_step}: injected at sigma_next={sigma_next:.4f}")
             
-            # Callback for preview (handle 5D video latent)
+            step_counter[0] += 1
+            
+            # Call original preview callback
             if callback is not None:
                 try:
-                    # For video latent [B,C,T,H,W], take middle frame for preview
                     if x.dim() == 5:
                         mid_frame = x.shape[2] // 2
-                        preview_x = x[:, :, mid_frame, :, :]  # [B,C,H,W]
+                        preview_x = x[:, :, mid_frame, :, :]
                     else:
                         preview_x = x
-                    callback(i, preview_x, None, total_steps)
+                    callback(step, preview_x, x_denoised, total_steps)
                 except Exception as e:
-                    print(f"[TTM] Preview callback error: {e}")
-            
-            pbar.update(1)
+                    pass  # Ignore preview errors
         
-        return x
+        # Initialize latent with noisy reference if TTM starts at step 0
+        latent_in = latent.to(device)
+        if ttm_start_step == 0:
+            sigma_init = sigmas[0].item()
+            latent_in = add_noise_at_sigma(ref, noise, sigma_init)
+            print(f"[TTM] Initialized with noisy ref at sigma={sigma_init:.4f}")
+        
+        # Use ComfyUI's standard sample function
+        samples = comfy.sample.sample(
+            model,
+            noise.to('cpu'),  # ComfyUI expects CPU noise
+            len(sigmas) - 1,  # steps
+            cfg,
+            "euler",
+            "normal",
+            positive,
+            negative,
+            latent_in.to('cpu'),  # latent tensor, not dict
+            denoise=1.0,
+            disable_noise=True,  # We already added noise
+            start_step=0,
+            last_step=len(sigmas) - 1,
+            force_full_denoise=True,
+            noise_mask=None,
+            callback=ttm_callback,
+            seed=0,
+        )
+        
+        # samples is a tensor, return it
+        return samples
 
 
 # Node registration
