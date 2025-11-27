@@ -210,13 +210,15 @@ class WanTTM_Sampler_Clean:
                 "positive": ("CONDITIONING",),
                 "negative": ("CONDITIONING",),
                 "latent": ("LATENT",),
-                "reference_latents": ("LATENT", {"tooltip": "TTM reference latents from PrepareLatents"}),
-                "motion_mask": ("MASK", {"tooltip": "Motion mask from PrepareLatents"}),
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
                 "steps": ("INT", {"default": 30, "min": 1, "max": 100}),
                 "cfg": ("FLOAT", {"default": 5.0, "min": 1.0, "max": 30.0, "step": 0.1}),
                 "ttm_start_step": ("INT", {"default": 0, "min": 0, "max": 100, "tooltip": "Step to start TTM (background starts denoising)"}),
                 "ttm_end_step": ("INT", {"default": 7, "min": 1, "max": 100, "tooltip": "Step to end TTM (motion starts normal denoising)"}),
+            },
+            "optional": {
+                "reference_latents": ("LATENT", {"tooltip": "TTM reference latents (optional, enables TTM when provided)"}),
+                "motion_mask": ("MASK", {"tooltip": "Motion mask (optional, required if reference_latents provided)"}),
             }
         }
     
@@ -231,75 +233,63 @@ class WanTTM_Sampler_Clean:
         positive,
         negative,
         latent,
-        reference_latents,
-        motion_mask,
         seed: int,
         steps: int,
         cfg: float,
         ttm_start_step: int,
         ttm_end_step: int,
+        reference_latents=None,
+        motion_mask=None,
     ):
         device = mm.get_torch_device()
         
-        print(f"\n[TTM Clean] === Starting TTM Sampling ===")
+        # Check if TTM is enabled
+        ttm_enabled = reference_latents is not None and motion_mask is not None
+        
+        print(f"\n[TTM Clean] === Starting Sampling ===")
         print(f"[TTM Clean] Steps: {steps}, CFG: {cfg}")
-        print(f"[TTM Clean] TTM range: [{ttm_start_step}, {ttm_end_step})")
+        print(f"[TTM Clean] TTM: {'ENABLED' if ttm_enabled else 'DISABLED'}")
+        if ttm_enabled:
+            print(f"[TTM Clean] TTM range: [{ttm_start_step}, {ttm_end_step})")
         print(f"[TTM Clean] Seed: {seed}")
         
         # Get latent samples
         x = latent["samples"].clone()
-        ref = reference_latents["samples"].clone()
-        mask = motion_mask.clone()
+        
+        if ttm_enabled:
+            ref = reference_latents["samples"].clone()
+            mask = motion_mask.clone()
+        else:
+            ref = None
+            mask = None
         
         print(f"[TTM Clean] Input latent shape: {x.shape}")
-        print(f"[TTM Clean] Reference latent shape: {ref.shape}")
-        print(f"[TTM Clean] Motion mask shape: {mask.shape}")
         
-        # Prepare mask for broadcasting
-        # Input mask: [T,h,w] or [B,T,h,w]
-        if mask.dim() == 3:
-            mask = mask.unsqueeze(0).unsqueeze(0)  # [1,1,T,h,w]
-        elif mask.dim() == 4:
-            mask = mask.unsqueeze(1)  # [B,1,T,h,w]
-        
-        # Expand to match latent shape [B,C,T,h,w]
-        if mask.shape[1] == 1 and ref.shape[1] > 1:
-            mask = mask.expand(-1, ref.shape[1], -1, -1, -1)
-        
-        print(f"[TTM Clean] Expanded mask shape: {mask.shape}")
-        print(f"[TTM Clean] Motion mask coverage: {mask.mean():.4f}")
+        if ttm_enabled:
+            print(f"[TTM Clean] Reference latent shape: {ref.shape}")
+            print(f"[TTM Clean] Motion mask shape: {mask.shape}")
+            
+            # Prepare mask for broadcasting
+            # Input mask: [T,h,w] or [B,T,h,w]
+            if mask.dim() == 3:
+                mask = mask.unsqueeze(0).unsqueeze(0)  # [1,1,T,h,w]
+            elif mask.dim() == 4:
+                mask = mask.unsqueeze(1)  # [B,1,T,h,w]
+            
+            # Expand to match latent shape [B,C,T,h,w]
+            if mask.shape[1] == 1 and ref.shape[1] > 1:
+                mask = mask.expand(-1, ref.shape[1], -1, -1, -1)
+            
+            print(f"[TTM Clean] Expanded mask shape: {mask.shape}")
+            print(f"[TTM Clean] Motion mask coverage: {mask.mean():.4f}")
         
         # Generate sigmas
         sigmas = get_sigmas(steps, device)
-        print(f"[TTM Clean] Sigmas: {sigmas.tolist()}")
+        print(f"[TTM Clean] Sigmas: first={sigmas[0]:.4f}, last={sigmas[-1]:.4f}")
         
-        # Generate fixed noise for TTM
+        # Generate fixed noise
         generator = torch.Generator(device='cpu').manual_seed(seed)
         noise = torch.randn(x.shape, generator=generator, device='cpu')
-        
-        # Validate TTM indices
-        ttm_start_step = max(0, min(ttm_start_step, steps - 1))
-        ttm_end_step = max(ttm_start_step + 1, min(ttm_end_step, steps))
-        
-        print(f"[TTM Clean] Validated TTM range: [{ttm_start_step}, {ttm_end_step})")
-        
-        # Move to device
-        ref = ref.to(device)
-        mask = mask.to(device)
-        noise = noise.to(device)
-        
-        # Create custom TTM sampler
-        ttm_sampler = TTMSampler(ref, mask, noise, ttm_start_step, ttm_end_step)
-        
-        # Create sampler wrapper for ComfyUI
-        class TTMSamplerWrapper:
-            def __init__(self, sampler):
-                self.sampler = sampler
-            
-            def sample(self, *args, **kwargs):
-                return self.sampler.sample(*args, **kwargs)
-        
-        sampler_obj = TTMSamplerWrapper(ttm_sampler)
         
         # Use ComfyUI's sample infrastructure
         mm.load_model_gpu(model)
@@ -307,43 +297,45 @@ class WanTTM_Sampler_Clean:
         # Create callback for preview
         preview_callback = latent_preview.prepare_callback(model, steps)
         
-        # Sample using comfy's infrastructure with our custom sampler
-        samples = comfy.sample.sample(
-            model,
-            noise,
-            steps,
-            cfg,
-            "euler",  # base sampler name
-            "normal",  # scheduler name
-            positive,
-            negative,
-            x,
-            denoise=1.0,
-            disable_noise=True,  # We handle noise ourselves
-            start_step=0,
-            last_step=steps,
-            force_full_denoise=True,
-            noise_mask=None,
-            callback=preview_callback,
-            seed=seed,
-        )
-        
-        # Actually, the above won't use our custom sampler. Let me try a different approach.
-        # Use sample_custom with a wrapped sampler
-        
-        # Create a proper KSAMPLER-compatible object
-        from comfy.samplers import KSAMPLER
-        
-        # We need to create a sampler that ComfyUI can use
-        # The easiest way is to use the callback mechanism properly
-        
-        # Let's use a simpler approach: run euler sampling and apply TTM in callback
-        
-        # Actually, let's just do manual sampling
-        result = cls._sample_with_ttm(
-            model, positive, negative, x, ref, mask, noise,
-            sigmas, cfg, ttm_start_step, ttm_end_step, preview_callback
-        )
+        if not ttm_enabled:
+            # Standard sampling without TTM - use ComfyUI's built-in sampler
+            print(f"[TTM Clean] Using standard euler sampling")
+            result = comfy.sample.sample(
+                model,
+                noise,
+                steps,
+                cfg,
+                "euler",
+                "normal",
+                positive,
+                negative,
+                x,
+                denoise=1.0,
+                disable_noise=False,
+                start_step=0,
+                last_step=steps,
+                force_full_denoise=True,
+                noise_mask=None,
+                callback=preview_callback,
+                seed=seed,
+            )
+        else:
+            # TTM sampling with manual loop
+            # Validate TTM indices
+            ttm_start_step = max(0, min(ttm_start_step, steps - 1))
+            ttm_end_step = max(ttm_start_step + 1, min(ttm_end_step, steps))
+            print(f"[TTM Clean] Validated TTM range: [{ttm_start_step}, {ttm_end_step})")
+            
+            # Move to device
+            ref = ref.to(device)
+            mask = mask.to(device)
+            noise = noise.to(device)
+            
+            # Manual sampling with TTM
+            result = cls._sample_with_ttm(
+                model, positive, negative, x, ref, mask, noise,
+                sigmas, cfg, ttm_start_step, ttm_end_step, preview_callback
+            )
         
         print(f"[TTM Clean] === Sampling Complete ===")
         print(f"[TTM Clean] Output latent range: [{result.min():.3f}, {result.max():.3f}]")
