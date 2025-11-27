@@ -56,17 +56,23 @@ def get_sigmas(num_steps: int, device: torch.device) -> torch.Tensor:
 
 
 class WanTTM_PrepareLatents:
-    """Prepare TTM reference latents and mask from input video."""
+    """Prepare TTM reference latents and mask.
+    
+    Supports two modes:
+    1. Direct LATENT input (recommended): Use pre-encoded latents from Wan VAE Encode
+    2. IMAGE input: Will try to encode via VAE (may have frame limits)
+    """
     
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "vae": ("VAE",),
-                "reference_video": ("IMAGE", {"tooltip": "Motion reference video [T,H,W,C] or [B,H,W,C]"}),
-                "motion_mask": ("IMAGE", {"tooltip": "Motion mask video, same frames as reference"}),
-                "width": ("INT", {"default": 832, "min": 64, "max": 2048, "step": 8}),
-                "height": ("INT", {"default": 480, "min": 64, "max": 2048, "step": 8}),
+                "motion_mask": ("IMAGE", {"tooltip": "Motion mask video [T,H,W,C]"}),
+            },
+            "optional": {
+                "reference_latents": ("LATENT", {"tooltip": "Pre-encoded reference latents (recommended)"}),
+                "reference_video": ("IMAGE", {"tooltip": "Reference video (will be encoded if no latents provided)"}),
+                "vae": ("VAE", {"tooltip": "VAE for encoding (required if using reference_video)"}),
             }
         }
     
@@ -76,50 +82,41 @@ class WanTTM_PrepareLatents:
     CATEGORY = "TTM"
     
     @classmethod
-    def execute(cls, vae, reference_video, motion_mask, width, height):
+    def execute(cls, motion_mask, reference_latents=None, reference_video=None, vae=None):
         device = mm.get_torch_device()
         
-        # Process reference video
-        # ComfyUI IMAGE format: [B,H,W,C] in [0,1] range
-        video = reference_video.clone()
-        print(f"[TTM Prepare] Input video shape: {video.shape}, dim: {video.dim()}")
-        
-        T = video.shape[0]  # Number of frames
-        
-        # Ensure [T,H,W,C] format
-        if video.dim() != 4:
-            raise ValueError(f"Expected 4D video tensor [T,H,W,C], got {video.dim()}D")
-        
-        # Resize to target size: [T,H,W,C] -> [T,C,H,W] for interpolate
-        video_chw = video.permute(0, 3, 1, 2)  # [T,C,H,W]
-        video_resized = F.interpolate(video_chw, size=(height, width), mode='bilinear', align_corners=False)
-        
-        # Back to [T,H,W,C] for VAE
-        video_for_vae = video_resized.permute(0, 2, 3, 1)  # [T,H,W,C]
-        
-        print(f"[TTM Prepare] Video for VAE: {video_for_vae.shape}")
-        
-        # VAE encode
-        with torch.no_grad():
-            latents = vae.encode(video_for_vae.to(device))
-        
-        print(f"[TTM Prepare] VAE output shape: {latents.shape}, dim: {latents.dim()}")
-        
-        # Handle different VAE output formats
-        if latents.dim() == 4:
-            # Standard image VAE: [T,C,h,w] -> [1,C,T,h,w]
-            latents = latents.permute(1, 0, 2, 3).unsqueeze(0)
-        elif latents.dim() == 5:
-            # Video VAE: already [B,C,T,h,w] or [T,C,1,h,w]
-            if latents.shape[0] == T:
-                # [T,C,1,h,w] -> [1,C,T,h,w]
-                latents = latents.squeeze(2).permute(1, 0, 2, 3).unsqueeze(0)
-            # else assume already [B,C,T,h,w]
+        # Get latents from input
+        if reference_latents is not None:
+            # Direct latent input (recommended)
+            latents = reference_latents["samples"].clone()
+            print(f"[TTM Prepare] Using pre-encoded latents: {latents.shape}")
+        elif reference_video is not None and vae is not None:
+            # Encode video via VAE
+            video = reference_video.clone()
+            print(f"[TTM Prepare] Encoding video: {video.shape}")
+            
+            T = video.shape[0]
+            video_for_vae = video  # [T,H,W,C]
+            
+            with torch.no_grad():
+                latents = vae.encode(video_for_vae.to(device))
+            
+            print(f"[TTM Prepare] VAE output: {latents.shape}")
+            
+            # Handle different VAE output formats
+            if latents.dim() == 4:
+                latents = latents.permute(1, 0, 2, 3).unsqueeze(0)
+            elif latents.dim() == 5:
+                if latents.shape[0] == T:
+                    latents = latents.squeeze(2).permute(1, 0, 2, 3).unsqueeze(0)
         else:
-            raise ValueError(f"Unexpected VAE output shape: {latents.shape}")
+            raise ValueError("Must provide either reference_latents or (reference_video + vae)")
+        
+        # Ensure 5D format [B,C,T,H,W]
+        if latents.dim() == 4:
+            latents = latents.unsqueeze(0)
         
         print(f"[TTM Prepare] Reference latents shape: {latents.shape}")
-        print(f"[TTM Prepare] Reference latents range: [{latents.min():.3f}, {latents.max():.3f}]")
         
         # Get latent spatial size
         _, C, T_lat, lh, lw = latents.shape
@@ -131,12 +128,18 @@ class WanTTM_PrepareLatents:
         # Ensure [T,H,W] format
         if mask.dim() == 4:
             mask = mask[..., 0]  # [T,H,W,C] -> [T,H,W]
-        if mask.dim() == 3:
-            pass  # Already [T,H,W]
-        elif mask.dim() == 2:
-            mask = mask.unsqueeze(0).expand(T_lat, -1, -1)  # Single mask -> expand to all frames
         
-        # Resize mask to latent size
+        T_mask = mask.shape[0]
+        
+        # Match mask frames to latent frames (Wan VAE has 4x temporal compression)
+        if T_mask != T_lat:
+            print(f"[TTM Prepare] Downsampling mask from {T_mask} to {T_lat} frames (4x temporal compression)")
+            # Temporal downsample: take every 4th frame, or use interpolation
+            # Simple approach: stride sampling to match latent frame count
+            indices = torch.linspace(0, T_mask - 1, T_lat).long()
+            mask = mask[indices]
+        
+        # Resize mask to latent spatial size
         mask = mask.unsqueeze(1).float()  # [T,1,H,W]
         mask = F.interpolate(mask, size=(lh, lw), mode='bilinear', align_corners=False)
         mask = mask.squeeze(1)  # [T,h,w]
@@ -144,7 +147,7 @@ class WanTTM_PrepareLatents:
         # Binarize
         mask = (mask > 0.5).float()
         
-        print(f"[TTM Prepare] Motion mask shape: {mask.shape}")
+        print(f"[TTM Prepare] Output mask shape: {mask.shape}")
         print(f"[TTM Prepare] Motion mask coverage: {mask.mean():.3f}")
         
         return ({"samples": latents.cpu()}, mask.cpu())
@@ -383,11 +386,22 @@ class WanTTM_Sampler_Clean:
         """Use ComfyUI's sampler with TTM callback injection."""
         device = mm.get_torch_device()
         
+        print(f"[TTM] Latent shape: {latent.shape}, Ref shape: {ref.shape}")
+        
         # Move TTM components to device
         ref = ref.to(device)
         motion_mask = motion_mask.to(device)
-        background_mask = 1.0 - motion_mask
         noise = noise.to(device)
+        
+        # Ensure mask has correct shape for broadcasting [1,C,T,H,W]
+        if motion_mask.dim() == 3:
+            motion_mask = motion_mask.unsqueeze(0).unsqueeze(0)  # [1,1,T,H,W]
+        if motion_mask.shape[1] == 1 and ref.shape[1] > 1:
+            motion_mask = motion_mask.expand(-1, ref.shape[1], -1, -1, -1)
+        
+        background_mask = 1.0 - motion_mask
+        
+        print(f"[TTM] Mask shape after expand: {motion_mask.shape}")
         
         # TTM state
         step_counter = [0]
@@ -398,35 +412,34 @@ class WanTTM_Sampler_Clean:
             
             # Apply TTM injection after each step
             if ttm_start_step <= current_step < ttm_end_step:
-                # Get current sigma for this step
                 sigma_next = sigmas[current_step + 1].item() if current_step + 1 < len(sigmas) else 0.0
                 
                 # Compute noisy reference at next sigma
                 noisy_ref = add_noise_at_sigma(ref, noise, sigma_next)
                 
-                # Blend in-place: background keeps denoised, motion gets noisy ref
+                # Blend in-place
                 x.mul_(background_mask).add_(noisy_ref * motion_mask)
                 
                 print(f"[TTM] Step {current_step}: injected at sigma_next={sigma_next:.4f}")
             
             step_counter[0] += 1
             
-            # Call original preview callback
+            # Preview callback
             if callback is not None:
                 try:
                     if x.dim() == 5:
-                        mid_frame = x.shape[2] // 2
-                        preview_x = x[:, :, mid_frame, :, :]
+                        preview_x = x[:, :, x.shape[2] // 2, :, :]
                     else:
                         preview_x = x
                     callback(step, preview_x, x_denoised, total_steps)
-                except Exception as e:
-                    pass  # Ignore preview errors
+                except Exception:
+                    pass
         
         # Initialize latent with noisy reference if TTM starts at step 0
         latent_in = latent.to(device)
         if ttm_start_step == 0:
             sigma_init = sigmas[0].item()
+            # Use expanded ref for initialization
             latent_in = add_noise_at_sigma(ref, noise, sigma_init)
             print(f"[TTM] Initialized with noisy ref at sigma={sigma_init:.4f}")
         
