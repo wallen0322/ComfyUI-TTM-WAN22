@@ -638,14 +638,23 @@ class WanTTM_Sampler:
         tstrong_index = int(ttm_params.get("ttm_end_step", steps))
         
         # Validate TTM indices
+        # CRITICAL: TTM must complete BEFORE MoE switch to low model
+        # Low model cannot handle high-noise TTM injection!
         if tstrong_index > steps:
             print(f"[WanTTM] WARNING: ttm_end_step {tstrong_index} > steps {steps}, clamping")
             tstrong_index = steps
+        if tstrong_index > switch_step:
+            print(f"[WanTTM] WARNING: ttm_end_step {tstrong_index} > switch_step {switch_step}")
+            print(f"[WanTTM] TTM must complete before MoE switch! Clamping tstrong to {switch_step}")
+            tstrong_index = switch_step
         if tweak_index < 0:
             tweak_index = 0
         if tweak_index >= steps:
             print(f"[WanTTM] WARNING: ttm_start_step {tweak_index} >= steps, disabling TTM")
             tweak_index = steps
+        if tweak_index >= tstrong_index:
+            print(f"[WanTTM] WARNING: tweak_index >= tstrong_index, disabling TTM")
+            tweak_index = tstrong_index
         
         ttm_enabled = (
             ttm_reference_latents is not None and 
@@ -664,8 +673,9 @@ class WanTTM_Sampler:
         if ttm_enabled:
             print(f"[WanTTM] TTM Dual Clock ENABLED")
             print(f"[WanTTM]   tweak_index (background starts): {tweak_index}")
-            print(f"[WanTTM]   tstrong_index (motion starts normal): {tstrong_index}")
-            print(f"[WanTTM]   TTM active steps: [{tweak_index}, {tstrong_index})")
+            print(f"[WanTTM]   tstrong_index (motion stops): {tstrong_index}")
+            print(f"[WanTTM]   switch_step (MoE boundary): {switch_step}")
+            print(f"[WanTTM]   TTM active steps: [{tweak_index}, {tstrong_index}) - HIGH model only!")
             
             # Prepare reference latents
             ref = ttm_reference_latents.to(device)
@@ -828,10 +838,12 @@ class WanTTM_Sampler:
                 sigmas_p1, disable_noise=disable_noise_p1, latent_in=latent_image
             )
             
-            # Phase 2: Low-noise model
+            # Phase 2: Low-noise model (NO TTM injection!)
             if has_phase_2:
                 sigmas_p2 = sigmas[switch_step_clamped:].clone()
                 print(f"[WanTTM] Phase 2: {len(sigmas_p2)-1} steps, sigmas [{sigmas_p2[0]:.4f} -> {sigmas_p2[-1]:.4f}]")
+                print(f"[WanTTM] Phase 2: TTM disabled, normal denoising with LOW model")
+                print(f"[WanTTM] Phase 2 input latent range: [{latent_image.min():.3f}, {latent_image.max():.3f}]")
                 
                 latent_image = run_flow_phase(
                     model_low, cfg_low, low_positive, low_negative,
