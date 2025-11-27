@@ -80,42 +80,64 @@ class WanTTM_PrepareLatents:
         device = mm.get_torch_device()
         
         # Process reference video
-        # Input: [T,H,W,C] or [B,H,W,C] in [0,1] range
-        video = reference_video
-        if video.dim() == 4:
-            # [T,H,W,C] -> assume it's frames
-            video = video.permute(0, 3, 1, 2)  # [T,C,H,W]
+        # ComfyUI IMAGE format: [B,H,W,C] in [0,1] range
+        video = reference_video.clone()
+        print(f"[TTM Prepare] Input video shape: {video.shape}, dim: {video.dim()}")
         
-        T = video.shape[0]
+        T = video.shape[0]  # Number of frames
         
-        # Resize to target
-        video = F.interpolate(video, size=(height, width), mode='bilinear', align_corners=False)
+        # Ensure [T,H,W,C] format
+        if video.dim() != 4:
+            raise ValueError(f"Expected 4D video tensor [T,H,W,C], got {video.dim()}D")
         
-        # VAE encode: expects [B,H,W,C] in ComfyUI
-        # Need to encode frame by frame or batch
-        video_for_vae = video.permute(0, 2, 3, 1)  # [T,H,W,C]
+        # Resize to target size: [T,H,W,C] -> [T,C,H,W] for interpolate
+        video_chw = video.permute(0, 3, 1, 2)  # [T,C,H,W]
+        video_resized = F.interpolate(video_chw, size=(height, width), mode='bilinear', align_corners=False)
         
+        # Back to [T,H,W,C] for VAE
+        video_for_vae = video_resized.permute(0, 2, 3, 1)  # [T,H,W,C]
+        
+        print(f"[TTM Prepare] Video for VAE: {video_for_vae.shape}")
+        
+        # VAE encode
         with torch.no_grad():
-            latents = vae.encode(video_for_vae.to(device))  # [T,C,h,w]
+            latents = vae.encode(video_for_vae.to(device))
         
-        # Reshape to [1,C,T,h,w] for video latent format
-        latents = latents.permute(1, 0, 2, 3).unsqueeze(0)  # [1,C,T,h,w]
+        print(f"[TTM Prepare] VAE output shape: {latents.shape}, dim: {latents.dim()}")
+        
+        # Handle different VAE output formats
+        if latents.dim() == 4:
+            # Standard image VAE: [T,C,h,w] -> [1,C,T,h,w]
+            latents = latents.permute(1, 0, 2, 3).unsqueeze(0)
+        elif latents.dim() == 5:
+            # Video VAE: already [B,C,T,h,w] or [T,C,1,h,w]
+            if latents.shape[0] == T:
+                # [T,C,1,h,w] -> [1,C,T,h,w]
+                latents = latents.squeeze(2).permute(1, 0, 2, 3).unsqueeze(0)
+            # else assume already [B,C,T,h,w]
+        else:
+            raise ValueError(f"Unexpected VAE output shape: {latents.shape}")
         
         print(f"[TTM Prepare] Reference latents shape: {latents.shape}")
         print(f"[TTM Prepare] Reference latents range: [{latents.min():.3f}, {latents.max():.3f}]")
         
-        # Process mask
-        mask = motion_mask
-        if mask.dim() == 4:
-            mask = mask[..., 0]  # Take first channel [T,H,W]
-        if mask.dim() == 3:
-            pass  # [T,H,W] is correct
-        
         # Get latent spatial size
-        _, _, _, lh, lw = latents.shape
+        _, C, T_lat, lh, lw = latents.shape
+        
+        # Process mask
+        mask = motion_mask.clone()
+        print(f"[TTM Prepare] Input mask shape: {mask.shape}")
+        
+        # Ensure [T,H,W] format
+        if mask.dim() == 4:
+            mask = mask[..., 0]  # [T,H,W,C] -> [T,H,W]
+        if mask.dim() == 3:
+            pass  # Already [T,H,W]
+        elif mask.dim() == 2:
+            mask = mask.unsqueeze(0).expand(T_lat, -1, -1)  # Single mask -> expand to all frames
         
         # Resize mask to latent size
-        mask = mask.unsqueeze(1)  # [T,1,H,W]
+        mask = mask.unsqueeze(1).float()  # [T,1,H,W]
         mask = F.interpolate(mask, size=(lh, lw), mode='bilinear', align_corners=False)
         mask = mask.squeeze(1)  # [T,h,w]
         
@@ -427,9 +449,18 @@ class WanTTM_Sampler_Clean:
                 x = x * background_mask + noisy_ref * motion_mask
                 print(f"[TTM] Step {i}: injected at sigma_next={sigma_next.item():.4f}")
             
-            # Callback for preview
+            # Callback for preview (handle 5D video latent)
             if callback is not None:
-                callback(i, x, None, total_steps)
+                try:
+                    # For video latent [B,C,T,H,W], take middle frame for preview
+                    if x.dim() == 5:
+                        mid_frame = x.shape[2] // 2
+                        preview_x = x[:, :, mid_frame, :, :]  # [B,C,H,W]
+                    else:
+                        preview_x = x
+                    callback(i, preview_x, None, total_steps)
+                except Exception as e:
+                    print(f"[TTM] Preview callback error: {e}")
             
             pbar.update(1)
         
