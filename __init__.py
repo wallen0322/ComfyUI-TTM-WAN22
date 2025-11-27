@@ -13,12 +13,21 @@ from .nodes_ttm_new import (
     WanTTM_Decode,
 )
 
+from .nodes_ttm_clean import (
+    WanTTM_PrepareLatents,
+    WanTTM_Sampler_Clean,
+)
+
 
 NODE_CLASS_MAPPINGS = {
+    # Original nodes
     "WanTTM_ModelFromUNet": WanTTM_ModelFromUNet,
     "WanTTM_Conditioning_New": WanTTM_Conditioning,
     "WanTTM_Sampler_New": WanTTM_Sampler,
     "WanTTM_Decode_New": WanTTM_Decode,
+    # Clean TTM nodes (extracted from KJ)
+    "WanTTM_PrepareLatents": WanTTM_PrepareLatents,
+    "WanTTM_Sampler_Clean": WanTTM_Sampler_Clean,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -26,4 +35,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "WanTTM_Conditioning_New": "Wan2.2 TTM: Conditioning",
     "WanTTM_Sampler_New": "Wan2.2 TTM: Sampler",
     "WanTTM_Decode_New": "Wan2.2 TTM: Decode",
+    # Clean TTM nodes
+    "WanTTM_PrepareLatents": "TTM: Prepare Latents (Clean)",
+    "WanTTM_Sampler_Clean": "TTM: Sampler (Clean)",
 }
