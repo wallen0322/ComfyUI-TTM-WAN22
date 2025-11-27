@@ -388,6 +388,34 @@ class WanTTM_Sampler_Clean:
         
         print(f"[TTM] Latent shape: {latent.shape}, Ref shape: {ref.shape}")
         
+        # Ensure ref matches latent spatial dimensions
+        # latent: [B,C,T,H,W], ref: [B,C,T,H,W]
+        if ref.shape[-2:] != latent.shape[-2:]:
+            print(f"[TTM] Resizing ref from {ref.shape[-2:]} to {latent.shape[-2:]}")
+            B, C, T, H_ref, W_ref = ref.shape
+            H_lat, W_lat = latent.shape[-2:]
+            # Reshape for interpolation: [B*C*T, 1, H, W]
+            ref_flat = ref.view(-1, 1, H_ref, W_ref)
+            ref_flat = F.interpolate(ref_flat, size=(H_lat, W_lat), mode='bilinear', align_corners=False)
+            ref = ref_flat.view(B, C, T, H_lat, W_lat)
+            print(f"[TTM] Ref resized to: {ref.shape}")
+        
+        # Also resize mask if needed
+        if motion_mask.dim() == 3:
+            # [T, H, W]
+            if motion_mask.shape[-2:] != latent.shape[-2:]:
+                print(f"[TTM] Resizing mask from {motion_mask.shape[-2:]} to {latent.shape[-2:]}")
+                T_m = motion_mask.shape[0]
+                H_lat, W_lat = latent.shape[-2:]
+                mask_4d = motion_mask.unsqueeze(1)  # [T, 1, H, W]
+                mask_4d = F.interpolate(mask_4d, size=(H_lat, W_lat), mode='bilinear', align_corners=False)
+                motion_mask = mask_4d.squeeze(1)  # [T, H, W]
+        
+        # Regenerate noise to match latent shape (in case ref had different shape)
+        if noise.shape != latent.shape:
+            print(f"[TTM] Regenerating noise to match latent shape: {latent.shape}")
+            noise = torch.randn_like(latent)
+        
         # Move TTM components to device
         ref = ref.to(device)
         motion_mask = motion_mask.to(device)
