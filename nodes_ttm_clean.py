@@ -292,6 +292,7 @@ class WanTTM_Sampler_Clean:
         x = latent["samples"].clone()
         
         if ttm_enabled:
+            # 原始参考 latent（来自 VAE 或 PrepareLatents）
             ref = reference_latents["samples"].clone()
             mask = motion_mask.clone()
         else:
@@ -301,7 +302,20 @@ class WanTTM_Sampler_Clean:
         print(f"[TTM Clean] Input latent shape: {x.shape}")
         
         if ttm_enabled:
-            print(f"[TTM Clean] Reference latent shape: {ref.shape}")
+            # === 关键：将 ref 对齐到模型的 latent_format ===
+            # 有些 Wan 模型会在内部对 latent 做通道/缩放/布局处理，
+            # 不处理的话，前景区域会和正常采样的 latent 处于不同分布，导致彩色噪声。
+            if ref.dim() == 4:
+                ref = ref.unsqueeze(0)  # [C,T,H,W] -> [1,C,T,H,W]
+
+            # 修正空通道 / 通道数
+            ref = comfy.sample.fix_empty_latent_channels(model_high, ref)
+
+            latent_format = model_high.get_model_object("latent_format")
+            if latent_format is not None:
+                ref = latent_format.process_in(ref)
+
+            print(f"[TTM Clean] Reference latent shape (after latent_format): {ref.shape}")
             print(f"[TTM Clean] Motion mask shape: {mask.shape}")
             
             # Prepare mask for broadcasting

@@ -258,6 +258,7 @@ class WanTTM_Conditioning:
                 "ttm_end_step": ("INT", {"default": 7, "min": 1, "max": 255, "step": 1}),
                 "mask_threshold": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Values >= threshold are treated as motion (1.0)."}),
                 "mask_dilate_px": ("INT", {"default": 0, "min": 0, "max": 32, "step": 1, "tooltip": "Dilate mask by N latent pixels using max-pool to increase coverage."}),
+                "low_noise_use_start_image": ("BOOLEAN", {"default": True, "tooltip": "低噪阶段首帧是否也使用 start_image 作为 concat image；关闭则整段用中灰。"}),
             }
         }
 
@@ -286,6 +287,7 @@ class WanTTM_Conditioning:
         ttm_end_step: int,
         mask_threshold: float,
         mask_dilate_px: int,
+        low_noise_use_start_image: bool,
     ):
         device = mm.get_torch_device()
 
@@ -533,32 +535,65 @@ class WanTTM_Conditioning:
         }
 
         # Use ComfyUI Wan's I2V mechanism: concat_latent_image + concat_mask
-        # This is the standard way to lock first frame in Wan models
-        
-        # concat_latent_image: VAE latent of start_image expanded to all frames
-        concat_latent_image = start_latent.to(device).expand(-1, -1, latent_frames, -1, -1).clone()
-        
-        # concat_mask: 0.0=locked (first frame), 1.0=free (rest frames)
-        # Format must match ComfyUI Wan's expectation: [B, 1, T, H, W]
+        # 高噪 / 低噪分开注入：
+        #   - 高噪：整段都看到 start_image 的 latent（更强的起始约束）；
+        #   - 低噪：只在首帧看到 start_image，后面帧看到的是 0.5 的灰底，避免整段在低噪被拉亮。
+
+        # --- 高噪阶段 concat ---
+        concat_latent_image_high = start_latent.to(device).expand(-1, -1, latent_frames, -1, -1).clone()
+
+        # --- 低噪阶段 concat ---
+        # 构造一段 image_low：
+        #   - 如果 low_noise_use_start_image=True：第 0 帧 = start_image，其它帧 = 0.5 灰；
+        #   - 如果为 False：整段都是 0.5 灰，只靠文本引导，完全不看 start_image。
+        image_low = torch.ones(
+            (num_frames, target_height_orig, target_width_orig, 3),
+            device=device, dtype=start_image.dtype
+        ) * 0.5
+        if low_noise_use_start_image:
+            # start 已经是保证 batch 维度的张量，这里只取第一帧
+            image_low[0:1] = start[0, :1, :, :, :3]
+        concat_latent_image_low = vae.encode(image_low[:, :, :, :3])
+
+        # 处理 VAE 可能返回的 4D/5D 形状，统一成 [B,C,T,H,W]
+        if isinstance(concat_latent_image_low, dict):
+            concat_latent_image_low = concat_latent_image_low["samples"]
+        if concat_latent_image_low.dim() == 4:
+            # [T,C,H,W] or [1*T,C,H,W] 情况：压成 [1,C,T,H,W]
+            if concat_latent_image_low.shape[0] == num_frames:
+                concat_latent_image_low = concat_latent_image_low.unsqueeze(0).permute(0, 2, 1, 3, 4).contiguous()
+        # 若已是 [B,C,T,H,W] 则直接使用
+
+        # --- concat_mask：0.0=锁定（首帧），1.0=自由（其它帧） ---
+        # 这里高噪 / 低噪共用同一份 mask：首帧锁定，其它帧自由生成。
         concat_mask = torch.ones(1, 1, latent_frames, h, w, device=device, dtype=start_latent.dtype)
-        concat_mask[:, :, :1] = 0.0  # Lock first frame
-        
-        # Add I2V conditioning
-        conditioning_data = {
-            "concat_latent_image": concat_latent_image.cpu(),
+        concat_mask[:, :, :1] = 0.0
+
+        # Add I2V conditioning（高噪 / 低噪各自用自己的 concat_latent_image）
+        conditioning_high = {
+            "concat_latent_image": concat_latent_image_high.cpu(),
             "concat_mask": concat_mask.cpu()
         }
-        high_positive = nodes.node_helpers.conditioning_set_values(positive, conditioning_data)
-        high_negative = nodes.node_helpers.conditioning_set_values(negative, conditioning_data)
-        low_positive = nodes.node_helpers.conditioning_set_values(positive, conditioning_data)
-        low_negative = nodes.node_helpers.conditioning_set_values(negative, conditioning_data)
+        conditioning_low = {
+            "concat_latent_image": concat_latent_image_low.cpu(),
+            "concat_mask": concat_mask.cpu()
+        }
+        high_positive = nodes.node_helpers.conditioning_set_values(positive, conditioning_high)
+        high_negative = nodes.node_helpers.conditioning_set_values(negative, conditioning_high)
+        low_positive = nodes.node_helpers.conditioning_set_values(positive, conditioning_low)
+        low_negative = nodes.node_helpers.conditioning_set_values(negative, conditioning_low)
         
         latent_dict = {"samples": latent.cpu()}
         
         motion_mask_preview = mask_t.mean().item()
         print(f"[WanTTM Conditioning] Mask coverage (mean of latent mask): {motion_mask_preview:.4f}")
-        print(f"[WanTTM Conditioning] Added I2V conditioning: concat_latent_image + concat_mask")
-        print(f"[WanTTM Conditioning] concat_mask: frame1=0.0 (locked), frames2-21=1.0 (free)")
+        print(f"[WanTTM Conditioning] Added I2V conditioning: HIGH/LOW split concat_latent_image + shared concat_mask")
+        print(f"[WanTTM Conditioning] HIGH concat: all frames = start_image latent")
+        if low_noise_use_start_image:
+            print(f"[WanTTM Conditioning] LOW concat: frame0 = start_image latent, others = gray(0.5)")
+        else:
+            print(f"[WanTTM Conditioning] LOW concat: all frames = gray(0.5)")
+        print(f"[WanTTM Conditioning] concat_mask: frame1=0.0 (locked), frames2-{latent_frames}=1.0 (free)")
         
         return (
             high_positive, high_negative,
@@ -698,7 +733,7 @@ class WanTTM_Sampler:
         ref = None
         motion_mask = None
         background_mask = None
-        fixed_noise = None
+        fixed_noise = None  # 保留占位，不再用于前景“自由噪声”
         sampling_high = None
         
         if ttm_enabled:
@@ -708,7 +743,7 @@ class WanTTM_Sampler:
             print(f"[WanTTM]   switch_step (MoE boundary): {switch_step}")
             print(f"[WanTTM]   TTM active steps: [{tweak_index}, {tstrong_index}) - HIGH model only!")
             
-            # Prepare reference latents
+            # Prepare reference latents（作为“目标运动引导”而不是“带噪起点”）
             ref = ttm_reference_latents.to(device)
             if ref.dim() == 4:
                 ref = ref.unsqueeze(0)
@@ -719,10 +754,10 @@ class WanTTM_Sampler:
             if latent_format is not None:
                 ref = latent_format.process_in(ref)
             
-            # Get model_sampling for noise_scaling in TTM injection
+            # Get model_sampling（目前仅用于 debug / 可能的缩放，前景不再注入自由噪声）
             sampling_high = model_high.get_model_object("model_sampling")
             
-            print(f"[WanTTM] Reference latent: {ref.shape}, range: [{ref.min():.3f}, {ref.max():.3f}]")
+            print(f"[WanTTM] Reference latent (clean guide): {ref.shape}, range: [{ref.min():.3f}, {ref.max():.3f}]")
             
             # Prepare mask: [T,1,h,w] -> [1,C,T,h,w]
             mask = ttm_mask.to(device)
@@ -745,29 +780,10 @@ class WanTTM_Sampler:
             else:
                 print(f"[WanTTM] Mask is dynamic, per-frame mean range: [{mask_per_frame.min():.3f}, {mask_per_frame.max():.3f}]")
             
-            # Generate fixed noise for TTM (used for all noisy reference calculations)
-            fixed_noise = torch.randn_like(ref)
-
-            # NOTE:
-            # The original diffusers TTM pipeline re-initializes the latent
-            # state at tweak_index using the noisy reference latents:
-            #
-            #   latents = add_noise(ref_latents, fixed_noise, tweak_t)
-            #
-            # However, in ComfyUI the base Wan I2V conditioning (start image
-            # locking via concat_latent_image + concat_mask) is applied
-            # through the model's conditioning stack, *not* via the initial
-            # latent. Replacing `latent_image` here with a noisy reference
-            # tends to destroy the strong I2V prior and leads to the noisy
-            # backgrounds you've observed.
-            #
-            # To keep behavior closer to other, working Wan I2V nodes, we
-            # keep `latent_image` as provided by the conditioning node and
-            # only use `ref` + `fixed_noise` inside the TTM injection
-            # callback (motion_mask region), leaving the background region
-            # to evolve from the standard I2V latent.
+            # 不再为前景生成单独的“自由噪声”初始状态，而是把 ref 当作“目标运动轨迹”。
+            # latent_image 仍由 I2V + 文本决定，TTM 只在运动区域做插值引导。
             sigma_init = sigmas[tweak_index].item()
-            print(f"[WanTTM] Prepared TTM reference at sigma={sigma_init:.4f} (latent_image left unchanged)")
+            print(f"[WanTTM] Prepared clean TTM reference at sigma={sigma_init:.4f} (latent_image left unchanged)")
         else:
             print(f"[WanTTM] TTM DISABLED, running standard MoE sampling")
         
@@ -805,44 +821,37 @@ class WanTTM_Sampler:
             
             global_step = global_step_counter[0]
             
-            # TTM injection: apply in range [tweak_index, tstrong_index)
-            if ttm_enabled and tweak_index <= global_step < tstrong_index:
-                # Calculate noisy reference at sigma_next
-                # CRITICAL: Use noise_scaling to ensure compatibility with FlowMatch's internal representation
+            # TTM injection：只在 tweak_index 这一跳注入一次，引导到参考运动轨迹；
+            # 后面的所有步（包括低噪阶段）完全按照普通 I2V 继续去噪。
+            if ttm_enabled and global_step == tweak_index:
+                # 计算当前步的 sigma（仅用于日志打印）
                 sigma_val = float(sigma_next) if not torch.is_tensor(sigma_next) else sigma_next.item()
-                
-                if sigma_val > 0 and sampling_high is not None and hasattr(sampling_high, "noise_scaling"):
-                    # Use noise_scaling to create properly scaled noisy reference
-                    sigma_tensor = torch.tensor(sigma_val, device=ref.device, dtype=ref.dtype)
-                    noisy_ref = sampling_high.noise_scaling(
-                        sigma_tensor,
-                        fixed_noise.to(device=ref.device, dtype=ref.dtype),
-                        ref,
-                        True  # max_denoise
-                    )
-                elif sigma_val > 0:
-                    # Fallback: use add_noise_at_sigma
-                    noisy_ref = add_noise_at_sigma(ref, fixed_noise, sigma_val)
-                else:
-                    # sigma=0 means clean reference
-                    noisy_ref = ref
-                
-                noisy_ref = noisy_ref.to(device=x.device, dtype=x.dtype)
+                # 在 ComfyUI 语义下：mask=1 表示“自由生成区域”，不应该在低噪阶段持续往里塞参考。
+                # 这里只在高噪早期打一针，把运动区域拉到 ref 附近，后面全部交给正常 FlowMatch I2V。
+                # 这里把 ref 视为“干净的运动引导”，不再叠加随机噪声，只在采样过程中插值靠近 ref。
+                guide_ref = ref
+
+                guide_ref = guide_ref.to(device=x.device, dtype=x.dtype)
                 bg_mask = background_mask.to(device=x.device, dtype=x.dtype)
                 mot_mask = motion_mask.to(device=x.device, dtype=x.dtype)
-                
-                # Debug log for first TTM step
-                if global_step == tweak_index:
-                    print(f"[WanTTM] TTM injection started at step {global_step}")
-                    print(f"[WanTTM]   sigma_next={sigma_val:.4f}")
-                    print(f"[WanTTM]   noisy_ref range: [{noisy_ref.min():.3f}, {noisy_ref.max():.3f}]")
-                
-                # Apply dual clock: background keeps denoised, motion gets noisy reference
-                # x = x * background_mask + noisy_ref * motion_mask
-                x.mul_(bg_mask).add_(noisy_ref * mot_mask)
-                
-                if global_step == tstrong_index - 1:
-                    print(f"[WanTTM] TTM injection ended at step {global_step}")
+
+                # 单次注入强度：alpha=1.0 表示 motion 区域直接对齐到 ref，
+                # 你如果觉得太狠，可以在节点参数里再加一个全局系数来调节。
+                alpha = 1.0
+                alpha_tensor = torch.as_tensor(alpha, dtype=x.dtype, device=x.device)
+
+                # Debug log
+                print(f"[WanTTM] TTM single-shot injection at step {global_step}")
+                print(f"[WanTTM]   sigma_next={sigma_val:.4f}")
+                print(f"[WanTTM]   guide_ref range: [{guide_ref.min():.3f}, {guide_ref.max():.3f}]")
+                print(f"[WanTTM]   alpha={alpha:.3f}")
+
+                # Apply dual clock（单次注入版本）：
+                #   motion 区域：x = (1-alpha)*x + alpha*guide_ref
+                #   background 区域：保持 x 不变
+                mot_alpha = mot_mask * alpha_tensor
+                bg_effective = bg_mask + mot_mask * (1.0 - alpha_tensor)
+                x.mul_(bg_effective).add_(guide_ref * mot_alpha)
             
             # Preview callback
             if preview_callback is not None:
@@ -896,7 +905,8 @@ class WanTTM_Sampler:
                 sigmas_p1, disable_noise=disable_noise_p1, latent_in=latent_image
             )
             
-            # Phase 2: Low-noise model (NO TTM injection!)
+            # Phase 2: Low-noise model（继续沿用高噪阶段的 latent，保持轨迹连续，
+            # 但不再做任何 TTM 注入，只受文本 + I2V concat_latent_image 影响）。
             if has_phase_2:
                 sigmas_p2 = sigmas[switch_step_clamped:].clone()
                 print(f"[WanTTM] Phase 2: {len(sigmas_p2)-1} steps, sigmas [{sigmas_p2[0]:.4f} -> {sigmas_p2[-1]:.4f}]")
