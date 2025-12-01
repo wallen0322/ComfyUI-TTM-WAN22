@@ -31,10 +31,31 @@ def generate_wan_sigmas(model_sampling, steps: int) -> torch.Tensor:
         sigmas = []
         for pct in percents:
             pct_value = float(min(max(pct, eps), 1.0 - eps))
-            sigma = float(model_sampling.percent_to_sigma(pct_value))
-            sigmas.append(sigma)
+            try:
+                sigma_val = float(model_sampling.percent_to_sigma(pct_value))
+            except Exception:
+                sigma_val = 0.0
+            sigmas.append(sigma_val)
+
         sigmas.append(0.0)
-        return torch.tensor(sigmas, dtype=torch.float32)
+        sigmas_tensor = torch.tensor(sigmas, dtype=torch.float32)
+
+        # Some non‑FlowMatch schedulers expose a percent_to_sigma API but
+        # return (near) zeros for all percents. In that case the schedule is
+        # unusable – fall back to the manual FlowMatch schedule below.
+        if sigmas_tensor[0] > 1e-6 and sigmas_tensor.max() > 1e-3:
+            inner = sigmas_tensor[:-1]
+            if inner.numel() >= 2:
+                diffs = inner[1:] - inner[:-1]
+                if torch.all(diffs <= 0):
+                    # Already monotonically decreasing: high -> low.
+                    return sigmas_tensor
+                if torch.all(diffs >= 0):
+                    # Monotonically increasing: flip so we go high -> low.
+                    inner = torch.flip(inner, dims=[0])
+                    sigmas_tensor = torch.cat([inner, sigmas_tensor[-1:]], dim=0)
+                    return sigmas_tensor
+        # Otherwise continue to the fallback path.
 
     # Fallback: manual Wan FlowMatch schedule
     sigma_max = float(getattr(model_sampling, "sigma_max", 1.0))

@@ -491,13 +491,43 @@ class WanTTM_Conditioning:
         # NOTE: Don't normalize here - sampler will use latent_format.process_in for consistency
         ref_latents = motion_latent[:1].detach()
         ttm_reference_latents = ref_latents.squeeze(0).contiguous()
-        
+
+        # Ensure TTM reference and mask spatial resolution match the base latent.
+        # WAN I2V in ComfyUI often uses higher spatial resolution for the start
+        # image than the motion signal video. If we don't upsample the TTM
+        # reference/mask to the latent resolution, TTM injection will fail with
+        # shape mismatches when blending into the sampler's latent `x`.
+        latent_h, latent_w = latent.shape[-2:]
+        ref_h, ref_w = ttm_reference_latents.shape[-2:]
+        mask_h, mask_w = ttm_mask.shape[-2:]
+
+        if (ref_h, ref_w) != (latent_h, latent_w):
+            import torch.nn.functional as F
+            print(f"[WanTTM Conditioning] Upscaling TTM reference from {(ref_h, ref_w)} to {(latent_h, latent_w)}")
+            # ttm_reference_latents: [C,T,h,w] -> [1,T,C,h,w] -> [T,C,h,w]
+            C_ref, T_ref = ttm_reference_latents.shape[0], ttm_reference_latents.shape[1]
+            ref_5d = ttm_reference_latents.unsqueeze(0)  # [1,C,T,h,w]
+            ref_flat = ref_5d.permute(0, 2, 1, 3, 4).reshape(T_ref, C_ref, ref_h, ref_w)
+            ref_flat = F.interpolate(ref_flat, size=(latent_h, latent_w), mode="bilinear", align_corners=False)
+            ref_5d = ref_flat.reshape(1, T_ref, C_ref, latent_h, latent_w).permute(0, 2, 1, 3, 4)
+            ttm_reference_latents = ref_5d.squeeze(0).contiguous()
+
+        if (mask_h, mask_w) != (latent_h, latent_w):
+            import torch.nn.functional as F
+            print(f"[WanTTM Conditioning] Upscaling TTM mask from {(mask_h, mask_w)} to {(latent_h, latent_w)}")
+            T_mask = ttm_mask.shape[0]
+            mask_flat = ttm_mask.reshape(T_mask, 1, mask_h, mask_w)
+            mask_flat = F.interpolate(mask_flat, size=(latent_h, latent_w), mode="nearest")
+            ttm_mask = mask_flat
+            mask_h, mask_w = latent_h, latent_w
+
         print(f"[WanTTM Conditioning] Reference latents: {ttm_reference_latents.shape}")
         print(f"[WanTTM Conditioning] Reference range: [{ttm_reference_latents.min():.3f}, {ttm_reference_latents.max():.3f}]")
-        
+        print(f"[WanTTM Conditioning] Mask coverage (mean of latent mask): {ttm_mask.mean().item():.4f}")
+
         ttm_params = {
-            "ttm_reference_latents": ttm_reference_latents,  # [C,T,h,w]
-            "ttm_mask": ttm_mask.detach(),                   # [T,1,h,w]
+            "ttm_reference_latents": ttm_reference_latents,  # [C,T,h,w] (aligned to latent)
+            "ttm_mask": ttm_mask.detach(),                   # [T,1,h,w] (aligned to latent)
             "ttm_start_step": int(ttm_start_step),
             "ttm_end_step": int(ttm_end_step),
         }
@@ -717,30 +747,27 @@ class WanTTM_Sampler:
             
             # Generate fixed noise for TTM (used for all noisy reference calculations)
             fixed_noise = torch.randn_like(ref)
-            
-            # TTM Initialization: Replace initial latent with noisy reference at sigma[tweak_index]
-            # CRITICAL: Use noise_scaling to ensure compatibility with inverse_noise_scaling
-            # noise_scaling expects: (sigma, noise, clean_latent, max_denoise)
-            # It combines clean_latent and noise at the given sigma, applying FlowMatch scaling
+
+            # NOTE:
+            # The original diffusers TTM pipeline re-initializes the latent
+            # state at tweak_index using the noisy reference latents:
+            #
+            #   latents = add_noise(ref_latents, fixed_noise, tweak_t)
+            #
+            # However, in ComfyUI the base Wan I2V conditioning (start image
+            # locking via concat_latent_image + concat_mask) is applied
+            # through the model's conditioning stack, *not* via the initial
+            # latent. Replacing `latent_image` here with a noisy reference
+            # tends to destroy the strong I2V prior and leads to the noisy
+            # backgrounds you've observed.
+            #
+            # To keep behavior closer to other, working Wan I2V nodes, we
+            # keep `latent_image` as provided by the conditioning node and
+            # only use `ref` + `fixed_noise` inside the TTM injection
+            # callback (motion_mask region), leaving the background region
+            # to evolve from the standard I2V latent.
             sigma_init = sigmas[tweak_index].item()
-            sampling_high = model_high.get_model_object("model_sampling")
-            
-            if hasattr(sampling_high, "noise_scaling"):
-                # Use noise_scaling with clean ref and fixed_noise to create properly scaled noisy latent
-                sigma_tensor = torch.tensor(sigma_init, device=ref.device, dtype=ref.dtype)
-                latent_image = sampling_high.noise_scaling(
-                    sigma_tensor,
-                    fixed_noise,
-                    ref,  # clean reference latent
-                    True  # max_denoise
-                )
-            else:
-                # Fallback: use add_noise_at_sigma (may cause issues with inverse_noise_scaling)
-                latent_image = add_noise_at_sigma(ref, fixed_noise, sigma_init)
-                print(f"[WanTTM] WARNING: model_sampling.noise_scaling not found, using add_noise_at_sigma")
-            
-            print(f"[WanTTM] Initialized latent with noisy ref at sigma={sigma_init:.4f}")
-            print(f"[WanTTM] Latent range after init: [{latent_image.min():.3f}, {latent_image.max():.3f}]")
+            print(f"[WanTTM] Prepared TTM reference at sigma={sigma_init:.4f} (latent_image left unchanged)")
         else:
             print(f"[WanTTM] TTM DISABLED, running standard MoE sampling")
         
@@ -884,11 +911,25 @@ class WanTTM_Sampler:
             # Fallback: use standard ComfyUI sampler
             print(f"[WanTTM] Using standard sampler: {sampler_name}")
             latent_image = comfy.sample.fix_empty_latent_channels(model_high, latent_image)
-            
-            # Note: TTM callback won't work properly with standard sampler
+
+            # NOTE:
+            # Standard ComfyUI samplers expect a callback with signature
+            #   callback(step, x0, x, total_steps)
+            # while our TTM callback is tailored for FlowMatch Euler and
+            # receives a single dict with rich context (sigmas, etc.).
+            # Trying to wire TTM into the non‑flow path easily leads to
+            # mismatched expectations and incorrect sigma handling.
+            #
+            # To keep behaviour predictable (and avoid runtime errors),
+            # we currently DISABLE TTM when the user selects a non‑flow
+            # scheduler, and only use the preview callback here.
             if ttm_enabled:
-                print(f"[WanTTM] WARNING: TTM may not work correctly with non-flow samplers!")
-            
+                print(
+                    "[WanTTM] WARNING: TTM is only supported with the "
+                    f"'{FLOW_SCHEDULER_NAME}' scheduler. Running WITHOUT TTM "
+                    "for this sampler."
+                )
+
             latent_image = comfy.sample.sample(
                 model_high, noise, steps, cfg_high, sampler_name, scheduler,
                 high_positive, high_negative, latent_image,
@@ -898,11 +939,11 @@ class WanTTM_Sampler:
                 last_step=switch_step_clamped,
                 force_full_denoise=has_phase_2,
                 noise_mask=noise_mask,
-                callback=ttm_callback if ttm_enabled else preview_callback,
+                callback=preview_callback,
                 disable_pbar=False,
                 seed=seed
             )
-            
+
             if has_phase_2:
                 latent_image = comfy.sample.fix_empty_latent_channels(model_low, latent_image)
                 latent_image = comfy.sample.sample(
@@ -914,7 +955,7 @@ class WanTTM_Sampler:
                     last_step=steps,
                     force_full_denoise=False,
                     noise_mask=noise_mask,
-                    callback=ttm_callback if ttm_enabled else None,
+                    callback=None,
                     disable_pbar=False,
                     seed=seed
                 )
