@@ -258,7 +258,9 @@ class WanTTM_Conditioning:
                 "ttm_end_step": ("INT", {"default": 7, "min": 1, "max": 255, "step": 1}),
                 "mask_threshold": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Values >= threshold are treated as motion (1.0)."}),
                 "mask_dilate_px": ("INT", {"default": 0, "min": 0, "max": 32, "step": 1, "tooltip": "Dilate mask by N latent pixels using max-pool to increase coverage."}),
+                "high_noise_lock_first_latent": ("BOOLEAN", {"default": True, "tooltip": "高噪阶段是否锁定第一个 latent 帧（I2V 首帧锁定）。关闭则高噪完全不锁 start_image。"}),
                 "low_noise_use_start_image": ("BOOLEAN", {"default": True, "tooltip": "低噪阶段首帧是否也使用 start_image 作为 concat image；关闭则整段用中灰。"}),
+                "low_noise_lock_first_frame": ("BOOLEAN", {"default": True, "tooltip": "低噪阶段首帧 concat_mask 是否为 0（锁定）。关闭则低噪所有帧 mask=1 完全自由生成。"}),
             }
         }
 
@@ -287,7 +289,9 @@ class WanTTM_Conditioning:
         ttm_end_step: int,
         mask_threshold: float,
         mask_dilate_px: int,
+        high_noise_lock_first_latent: bool,
         low_noise_use_start_image: bool,
+        low_noise_lock_first_frame: bool,
     ):
         device = mm.get_torch_device()
 
@@ -564,19 +568,28 @@ class WanTTM_Conditioning:
                 concat_latent_image_low = concat_latent_image_low.unsqueeze(0).permute(0, 2, 1, 3, 4).contiguous()
         # 若已是 [B,C,T,H,W] 则直接使用
 
-        # --- concat_mask：0.0=锁定（首帧），1.0=自由（其它帧） ---
-        # 这里高噪 / 低噪共用同一份 mask：首帧锁定，其它帧自由生成。
-        concat_mask = torch.ones(1, 1, latent_frames, h, w, device=device, dtype=start_latent.dtype)
-        concat_mask[:, :, :1] = 0.0
+        # --- concat_mask：0.0=锁定，1.0=自由 ---
+        # 高噪：可选是否锁定第一个 latent 帧。
+        concat_mask_high = torch.ones(1, 1, latent_frames, h, w, device=device, dtype=start_latent.dtype)
+        if high_noise_lock_first_latent:
+            # I2V 标准行为：第一个 latent 帧锁定到 start_image，其它帧自由生成。
+            concat_mask_high[:, :, :1] = 0.0
 
-        # Add I2V conditioning（高噪 / 低噪各自用自己的 concat_latent_image）
+        # 低噪：可选首帧是否继续锁定；
+        #   - low_noise_lock_first_frame=True：跟高噪一样，0 帧锁定，其它帧自由；
+        #   - False：所有帧 mask=1，真正意义上的“全程自由生成”。
+        concat_mask_low = torch.ones(1, 1, latent_frames, h, w, device=device, dtype=start_latent.dtype)
+        if low_noise_lock_first_frame:
+            concat_mask_low[:, :, :1] = 0.0
+
+        # Add I2V conditioning（高噪 / 低噪各自用自己的 concat_latent_image + concat_mask）
         conditioning_high = {
             "concat_latent_image": concat_latent_image_high.cpu(),
-            "concat_mask": concat_mask.cpu()
+            "concat_mask": concat_mask_high.cpu()
         }
         conditioning_low = {
             "concat_latent_image": concat_latent_image_low.cpu(),
-            "concat_mask": concat_mask.cpu()
+            "concat_mask": concat_mask_low.cpu()
         }
         high_positive = nodes.node_helpers.conditioning_set_values(positive, conditioning_high)
         high_negative = nodes.node_helpers.conditioning_set_values(negative, conditioning_high)
@@ -587,13 +600,17 @@ class WanTTM_Conditioning:
         
         motion_mask_preview = mask_t.mean().item()
         print(f"[WanTTM Conditioning] Mask coverage (mean of latent mask): {motion_mask_preview:.4f}")
-        print(f"[WanTTM Conditioning] Added I2V conditioning: HIGH/LOW split concat_latent_image + shared concat_mask")
+        print(f"[WanTTM Conditioning] Added I2V conditioning: HIGH/LOW split concat_latent_image + separate masks")
         print(f"[WanTTM Conditioning] HIGH concat: all frames = start_image latent")
         if low_noise_use_start_image:
             print(f"[WanTTM Conditioning] LOW concat: frame0 = start_image latent, others = gray(0.5)")
         else:
             print(f"[WanTTM Conditioning] LOW concat: all frames = gray(0.5)")
-        print(f"[WanTTM Conditioning] concat_mask: frame1=0.0 (locked), frames2-{latent_frames}=1.0 (free)")
+        print(f"[WanTTM Conditioning] HIGH mask: frame0=0.0 (locked), frames1-{latent_frames-1}=1.0 (free)")
+        if low_noise_lock_first_frame:
+            print(f"[WanTTM Conditioning] LOW mask: frame0=0.0 (locked), frames1-{latent_frames-1}=1.0 (free)")
+        else:
+            print(f"[WanTTM Conditioning] LOW mask: all frames = 1.0 (free)")
         
         return (
             high_positive, high_negative,
@@ -637,6 +654,9 @@ class WanTTM_Sampler:
             },
             "optional": {
                 "ttm_params": ("DICT", {}),
+                "skip_low_phase": ("BOOLEAN", {"default": False}),
+                "use_high_for_low": ("BOOLEAN", {"default": False}),
+                "ttm_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "TTM 注入强度（0=不注入，1=完全对齐参考运动）。"}),
             }
         }
 
@@ -664,6 +684,9 @@ class WanTTM_Sampler:
         scheduler: str,
         denoise: float,
         ttm_params: Dict[str, Any] = None,
+        skip_low_phase: bool = False,
+        use_high_for_low: bool = False,
+        ttm_strength: float = 1.0,
     ):
         """TTM Dual Clock Denoising with MoE support.
         
@@ -682,6 +705,13 @@ class WanTTM_Sampler:
         
         print(f"[WanTTM] === Starting TTM Sampler ===")
         print(f"[WanTTM] Initial latent shape: {latent_image.shape}")
+        if skip_low_phase:
+            print(f"[WanTTM] skip_low_phase=True -> will skip LOW phase")
+        if use_high_for_low:
+            print(f"[WanTTM] use_high_for_low=True -> reuse HIGH model in low phase")
+        if skip_low_phase:
+            print(f"[WanTTM] skip_low_phase=True -> will run HIGH phase only, no LOW refinement")
+        print(f"[WanTTM] TTM strength (alpha): {ttm_strength:.3f}")
 
         # Generate sigma schedule using model's parameters
         sampling_high = model_high.get_model_object("model_sampling")
@@ -794,7 +824,7 @@ class WanTTM_Sampler:
         
         # MoE phase configuration
         switch_step_clamped = min(max(switch_step, 1), steps)
-        has_phase_2 = switch_step_clamped < steps
+        has_phase_2 = (switch_step_clamped < steps) and (not skip_low_phase)
         
         print(f"[WanTTM] MoE Configuration:")
         print(f"[WanTTM]   Phase 1 (HIGH): steps 0-{switch_step_clamped-1}, CFG={cfg_high}")
@@ -835,9 +865,8 @@ class WanTTM_Sampler:
                 bg_mask = background_mask.to(device=x.device, dtype=x.dtype)
                 mot_mask = motion_mask.to(device=x.device, dtype=x.dtype)
 
-                # 单次注入强度：alpha=1.0 表示 motion 区域直接对齐到 ref，
-                # 你如果觉得太狠，可以在节点参数里再加一个全局系数来调节。
-                alpha = 1.0
+                # 单次注入强度：alpha 表示 motion 区域拉向 ref 的比例；1.0=完全对齐，0.5=折中。
+                alpha = max(0.0, min(float(ttm_strength), 1.0))
                 alpha_tensor = torch.as_tensor(alpha, dtype=x.dtype, device=x.device)
 
                 # Debug log
@@ -859,8 +888,14 @@ class WanTTM_Sampler:
             
             global_step_counter[0] += 1
 
-        def run_flow_phase(model, cfg, pos, neg, phase_sigmas, disable_noise, latent_in):
-            """Run a single MoE phase with FlowMatch sampling."""
+        def run_flow_phase(model, cfg, pos, neg, phase_sigmas, disable_noise, latent_in,
+                           skip_final_scaling: bool = False):
+            """Run a single MoE phase with FlowMatch sampling.
+
+            Args:
+                skip_final_scaling: If True, skip inverse_noise_scaling at the end.
+                                    Use this for Phase 1 when Phase 2 follows.
+            """
             current_sigmas[0] = phase_sigmas
             return sample_flowmatch_ttm(
                 model=model,
@@ -872,6 +907,7 @@ class WanTTM_Sampler:
                 latent_image=latent_in,
                 disable_noise=disable_noise,
                 force_zero_end=True,
+                skip_final_scaling=skip_final_scaling,
                 noise_mask=noise_mask,
                 callback=ttm_callback,
                 disable_pbar=False,
@@ -897,25 +933,38 @@ class WanTTM_Sampler:
                     sigmas_p1 = sigmas.clone()
             
             print(f"[WanTTM] Phase 1: {len(sigmas_p1)-1} steps, sigmas [{sigmas_p1[0]:.4f} -> {sigmas_p1[-1]:.4f}]")
-            
-            # Phase 1: disable_noise=True if TTM (we pre-noised), or if there's phase 2
-            disable_noise_p1 = ttm_enabled or has_phase_2
+
+            # FIX: Phase 1 should only disable_noise if TTM has pre-initialized the latent.
+            # 当 has_phase_2=True 但 ttm_enabled=False 时，Phase 1 仍然需要从 noise 初始化！
+            disable_noise_p1 = ttm_enabled
+            # 有 Phase 2 时，Phase 1 不能做 inverse_noise_scaling，否则会把 latent 放回输出空间导致数值放大。
+            skip_scaling_p1 = has_phase_2
+
+            print(f"[WanTTM] Phase 1 config: disable_noise={disable_noise_p1}, skip_final_scaling={skip_scaling_p1}")
+            print(f"[WanTTM] Phase 1 input latent range: [{latent_image.min():.3f}, {latent_image.max():.3f}]")
+
             latent_image = run_flow_phase(
                 model_high, cfg_high, high_positive, high_negative,
-                sigmas_p1, disable_noise=disable_noise_p1, latent_in=latent_image
+                sigmas_p1, disable_noise=disable_noise_p1, latent_in=latent_image,
+                skip_final_scaling=skip_scaling_p1,
             )
+
+            print(f"[WanTTM] Phase 1 output latent range: [{latent_image.min():.3f}, {latent_image.max():.3f}]")
             
             # Phase 2: Low-noise model（继续沿用高噪阶段的 latent，保持轨迹连续，
             # 但不再做任何 TTM 注入，只受文本 + I2V concat_latent_image 影响）。
             if has_phase_2:
                 sigmas_p2 = sigmas[switch_step_clamped:].clone()
                 print(f"[WanTTM] Phase 2: {len(sigmas_p2)-1} steps, sigmas [{sigmas_p2[0]:.4f} -> {sigmas_p2[-1]:.4f}]")
-                print(f"[WanTTM] Phase 2: TTM disabled, normal denoising with LOW model")
+                print(f"[WanTTM] Phase 2: TTM disabled, normal denoising with {'HIGH' if use_high_for_low else 'LOW'} model")
                 print(f"[WanTTM] Phase 2 input latent range: [{latent_image.min():.3f}, {latent_image.max():.3f}]")
-                
+
+                # Phase 2: disable_noise=True（接着 Phase 1 输出继续），skip_final_scaling=False（最终阶段要做一次 inverse_noise_scaling）
                 latent_image = run_flow_phase(
-                    model_low, cfg_low, low_positive, low_negative,
-                    sigmas_p2, disable_noise=True, latent_in=latent_image
+                    model_high if use_high_for_low else model_low,
+                    cfg_low, low_positive, low_negative,
+                    sigmas_p2, disable_noise=True, latent_in=latent_image,
+                    skip_final_scaling=False,
                 )
         else:
             # Fallback: use standard ComfyUI sampler

@@ -108,11 +108,14 @@ class FlowEulerSamplerTTM(comfy.samplers.Sampler):
     - Passes full sigmas array to callback for TTM sigma lookup
     - Callback can modify x in-place after each Euler step
     - Supports MoE two-phase sampling (disable_noise for phase continuation)
+    - skip_final_scaling: Skip inverse_noise_scaling (for intermediate phases)
     """
 
-    def __init__(self, disable_noise: bool = False, force_zero_end: bool = False):
+    def __init__(self, disable_noise: bool = False, force_zero_end: bool = False,
+                 skip_final_scaling: bool = False):
         self.disable_noise = disable_noise
         self.force_zero_end = force_zero_end
+        self.skip_final_scaling = skip_final_scaling
 
     def sample(
         self,
@@ -181,11 +184,33 @@ class FlowEulerSamplerTTM(comfy.samplers.Sampler):
                 })
 
         # Final inverse scaling
-        # CRITICAL: If disable_noise=True and we started with a pre-scaled latent (e.g., TTM),
-        # we may need to skip inverse_noise_scaling or handle it differently.
-        # For now, always apply inverse_noise_scaling as it's required by FlowMatch models.
-        samples = model_wrap.inner_model.model_sampling.inverse_noise_scaling(sigmas[-1], x)
-        return samples
+        # CRITICAL FIX: Only apply inverse_noise_scaling on the FINAL phase when sigma=0
+        # 
+        # The issue: inverse_noise_scaling(sigma, x) typically does x / (1 - sigma)
+        # - When sigma=0: x / 1.0 = x (no change, correct)
+        # - When sigma=0.4545: x / 0.5455 ≈ x * 1.83 (WRONG! values get amplified)
+        #
+        # For two-phase sampling:
+        # - Phase 1 ends at sigma > 0 (e.g., 0.4545), we MUST skip inverse_noise_scaling
+        # - Phase 2 ends at sigma = 0, we SHOULD apply inverse_noise_scaling
+        
+        if self.skip_final_scaling:
+            # Intermediate phase: return x directly without any scaling
+            # This is CRITICAL - we're not at sigma=0, so inverse_noise_scaling would amplify values
+            print(f"[FlowEulerSamplerTTM] Skipping inverse_noise_scaling (intermediate phase, sigma={sigmas[-1]:.4f})")
+            return x
+        else:
+            # Final phase: apply inverse scaling only when sigma is close to 0
+            final_sigma = sigmas[-1]
+            if final_sigma < 1e-5:
+                # sigma ≈ 0, safe to apply inverse_noise_scaling
+                samples = model_wrap.inner_model.model_sampling.inverse_noise_scaling(final_sigma, x)
+                print(f"[FlowEulerSamplerTTM] Applied inverse_noise_scaling (final phase, sigma={final_sigma:.6f})")
+                return samples
+            else:
+                # sigma > 0, DO NOT apply inverse_noise_scaling (would amplify values)
+                print(f"[FlowEulerSamplerTTM] WARNING: Final sigma={final_sigma:.4f} > 0, skipping inverse_noise_scaling to avoid amplification")
+                return x
 
 
 def sample_flowmatch_ttm(
@@ -198,6 +223,7 @@ def sample_flowmatch_ttm(
     latent_image: torch.Tensor,
     disable_noise: bool = False,
     force_zero_end: bool = False,
+    skip_final_scaling: bool = False,
     noise_mask: Optional[torch.Tensor] = None,
     callback: Optional[Callable] = None,
     disable_pbar: bool = False,
@@ -223,7 +249,11 @@ def sample_flowmatch_ttm(
     Returns:
         Denoised latent tensor
     """
-    sampler = FlowEulerSamplerTTM(disable_noise=disable_noise, force_zero_end=force_zero_end)
+    sampler = FlowEulerSamplerTTM(
+        disable_noise=disable_noise,
+        force_zero_end=force_zero_end,
+        skip_final_scaling=skip_final_scaling,
+    )
     return comfy_sample.sample_custom(
         model=model,
         noise=noise,
